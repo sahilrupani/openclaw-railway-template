@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenClaw Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #0f1117; overflow: hidden; }
+    #terminal-container { position: absolute; inset: 0 0 28px 0; }
+    #status-bar { position: absolute; bottom: 0; left: 0; right: 0; height: 28px; background: #1e2433; border-top: 1px solid #334155; display: flex; align-items: center; padding: 0 12px; font-family: system-ui, sans-serif; font-size: 12px; color: #94a3b8; gap: 8px; }
+    #status-dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; flex-shrink: 0; }
+    #status-dot.connecting { background: #f59e0b; }
+    #status-dot.connected { background: #22c55e; }
+    #status-dot.error { background: #ef4444; }
+    #overlay { position: absolute; inset: 0; background: rgba(15,17,23,0.92); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; font-family: system-ui, sans-serif; color: #e2e8f0; z-index: 10; }
+    #overlay.hidden { display: none; }
+    #overlay h2 { font-size: 1.1rem; font-weight: 600; }
+    #overlay p { font-size: 0.85rem; color: #94a3b8; text-align: center; max-width: 300px; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #334155; border-top-color: #6366f1; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #pwd-form { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    #pwd-input { background: #1e2433; border: 1px solid #334155; color: #e2e8f0; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 240px; outline: none; }
+    #pwd-input:focus { border-color: #6366f1; }
+    #pwd-btn { background: #6366f1; color: white; border: none; padding: 8px 20px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    #pwd-btn:hover { background: #4f46e5; }
+  </style>
+</head>
+<body>
+  <div id="terminal-container"></div>
+  <div id="status-bar"><div id="status-dot"></div><span id="status-text">Connecting...</span></div>
+  <div id="overlay">
+    <div class="spinner"></div>
+    <h2>Connecting to terminal</h2>
+    <p>Establishing secure session...</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    let password = params.get("pwd") || "";
+
+    const overlay = document.getElementById("overlay");
+    const statusDot = document.getElementById("status-dot");
+    const statusText = document.getElementById("status-text");
+
+    function setStatus(state, text) {
+      statusDot.className = state;
+      statusText.textContent = text;
+    }
+
+    function showOverlay(html) {
+      overlay.innerHTML = html;
+      overlay.classList.remove("hidden");
+    }
+
+    function hideOverlay() {
+      overlay.classList.add("hidden");
+    }
+
+    const term = new Terminal({
+      theme: { background: "#0f1117", foreground: "#e2e8f0", cursor: "#6366f1", selectionBackground: "#334155" },
+      fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", monospace',
+      fontSize: 14,
+      lineHeight: 1.2,
+      cursorBlink: true,
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+    term.open(document.getElementById("terminal-container"));
+
+    let ws = null;
+    let reconnectCount = 0;
+    const MAX_RECONNECT = 3;
+    const NO_RECONNECT_CODES = new Set([4001, 4002, 4003, 1008]);
+
+    function getWsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${location.host}/tui/ws`;
+    }
+
+    function getAuthProtocol() {
+      if (!password) return [];
+      const encoded = btoa(`user:${password}`);
+      return [`auth-${encoded}`];
+    }
+
+    function connect() {
+      if (!password) {
+        showOverlay(`
+          <h2>Authentication required</h2>
+          <p>Enter your setup password to access the terminal.</p>
+          <div id="pwd-form">
+            <input id="pwd-input" type="password" placeholder="Setup password" autofocus />
+            <button id="pwd-btn">Connect</button>
+          </div>
+        `);
+        setTimeout(() => {
+          const input = document.getElementById("pwd-input");
+          const btn = document.getElementById("pwd-btn");
+          if (!input) return;
+          input.focus();
+          const submit = () => { password = input.value; if (password) connect(); };
+          btn.addEventListener("click", submit);
+          input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+        }, 50);
+        return;
+      }
+
+      setStatus("connecting", "Connecting...");
+      showOverlay(`<div class="spinner"></div><h2>Connecting to terminal</h2><p>Establishing session...</p>`);
+
+      ws = new WebSocket(getWsUrl(), getAuthProtocol());
+
+      ws.onopen = () => {
+        reconnectCount = 0;
+        setStatus("connected", "Connected");
+        hideOverlay();
+        fitAddon.fit();
+        const { cols, rows } = term;
+        ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      };
+
+      ws.onmessage = e => {
+        term.write(e.data);
+      };
+
+      ws.onerror = () => {
+        setStatus("error", "Connection error");
+      };
+
+      ws.onclose = e => {
+        setStatus("error", `Disconnected (${e.code})`);
+        if (NO_RECONNECT_CODES.has(e.code)) {
+          const messages = {
+            4001: "<h2>Session conflict</h2><p>Another terminal session is already active. Close it first.</p>",
+            4002: "<h2>Session expired</h2><p>The terminal session timed out due to inactivity.</p>",
+            4003: "<h2>Terminal disabled</h2><p>The Web TUI feature is not enabled on this deployment.</p>",
+            1008: "<h2>Authentication failed</h2><p>Incorrect password.</p>",
+          };
+          if (e.code === 1008) password = "";
+          showOverlay(messages[e.code] ?? "<h2>Disconnected</h2><p>This session cannot be resumed.</p>");
+          return;
+        }
+        if (reconnectCount < MAX_RECONNECT) {
+          reconnectCount++;
+          const delay = reconnectCount * 1500;
+          setStatus("connecting", `Reconnecting (${reconnectCount}/${MAX_RECONNECT})...`);
+          setTimeout(connect, delay);
+        } else {
+          showOverlay("<h2>Disconnected</h2><p>Could not reconnect. <a href='' style='color:#6366f1'>Reload page</a> to try again.</p>");
+        }
+      };
+
+      term.onData(data => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "input", data }));
+        }
+      });
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      fitAddon.fit();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const { cols, rows } = term;
+        ws.send(JSON.stringify({ type: "resize", cols, rows }));
+      }
+    });
+    resizeObserver.observe(document.getElementById("terminal-container"));
+
+    connect();
+  </script>
+</body>
+</html>
