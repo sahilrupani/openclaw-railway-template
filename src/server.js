@@ -83,6 +83,11 @@ const OPENCLAW_ENTRY =
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
+
+// If true, /setup can auto-approve pending Control UI device requests (recommended for non-tech UX)
+const AUTO_APPROVE_UI_DEVICES =
+  process.env.AUTO_APPROVE_UI_DEVICES?.toLowerCase() === "true";
+
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
   10,
@@ -543,6 +548,66 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   });
 });
 
+// Auto-approve pending Control UI pairing requests (safe-ish: guarded by /setup Basic Auth)
+app.post("/setup/api/devices/auto-approve", requireSetupAuth, async (_req, res) => {
+  try {
+    if (!AUTO_APPROVE_UI_DEVICES) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "AUTO_APPROVE_UI_DEVICES is disabled. Set AUTO_APPROVE_UI_DEVICES=true in Railway Variables.",
+      });
+    }
+
+    // 1) List pending device requests
+    const listRes = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+    const listOutput = redactSecrets(listRes.output || "");
+
+    if (listRes.code !== 0) {
+      return res.status(500).json({
+        ok: false,
+        error: "Failed to list devices",
+        listOutput,
+        exitCode: listRes.code,
+      });
+    }
+
+    // 2) Extract pending request UUIDs
+    const requestIds = extractPendingUiRequestIds(listRes.output || "");
+
+    if (requestIds.length === 0) {
+      return res.json({
+        ok: true,
+        approved: [],
+        message:
+          "No pending device requests found. Open /openclaw once (to generate a request), then retry.",
+        listOutput,
+      });
+    }
+
+    // 3) Approve all pending requests (usually 1)
+    const approved = [];
+    for (const id of requestIds) {
+      const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", id]));
+      approved.push({
+        requestId: id,
+        ok: r.code === 0,
+        exitCode: r.code,
+        output: redactSecrets(r.output || ""),
+      });
+    }
+
+    return res.json({
+      ok: approved.every((x) => x.ok),
+      approved,
+      listOutput,
+    });
+  } catch (err) {
+    console.error("[/setup/api/devices/auto-approve] error:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 function buildOnboardArgs(payload) {
   const args = [
     "onboard",
@@ -816,6 +881,15 @@ function redactSecrets(text) {
     // Telegram bot tokens look like: 123456:ABCDEF...
     .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
+}
+
+function extractPendingUiRequestIds(output) {
+  // The "devices list" output includes a "Request" column that contains UUIDs like:
+  // 59e28ac9-d501-4bce-bb9f-19e636090fb8
+  // We should ONLY extract UUIDs (not device ids).
+  const uuidRegex =
+    /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+  return Array.from(new Set((output || "").match(uuidRegex) || []));
 }
 
 // ========== WEB TUI: AUTH + SESSION MANAGEMENT ==========
