@@ -84,9 +84,16 @@ const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
 
-// If true, /setup can auto-approve pending Control UI device requests (recommended for non-tech UX)
+// If true, wrapper auto-approves pending Control UI device requests (recommended for non-tech UX)
 const AUTO_APPROVE_UI_DEVICES =
   process.env.AUTO_APPROVE_UI_DEVICES?.toLowerCase() === "true";
+const AUTO_APPROVE_COOLDOWN_MS_RAW = Number.parseInt(
+  process.env.AUTO_APPROVE_COOLDOWN_MS ?? "4000",
+  10,
+);
+const AUTO_APPROVE_COOLDOWN_MS = Number.isFinite(AUTO_APPROVE_COOLDOWN_MS_RAW)
+  ? Math.max(AUTO_APPROVE_COOLDOWN_MS_RAW, 500)
+  : 4000;
 
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
@@ -559,49 +566,17 @@ app.post("/setup/api/devices/auto-approve", requireSetupAuth, async (_req, res) 
       });
     }
 
-    // 1) List pending device requests
-    const listRes = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
-    const listOutput = redactSecrets(listRes.output || "");
-
-    if (listRes.code !== 0) {
-      return res.status(500).json({
-        ok: false,
-        error: "Failed to list devices",
-        listOutput,
-        exitCode: listRes.code,
-      });
-    }
-
-    // 2) Extract pending request UUIDs
-    const requestIds = extractPendingUiRequestIds(listRes.output || "");
-
-    if (requestIds.length === 0) {
+    const result = await autoApprovePendingUiDevices();
+    if (result.ok && result.approved.length === 0) {
       return res.json({
         ok: true,
         approved: [],
         message:
           "No pending device requests found. Open /openclaw once (to generate a request), then retry.",
-        listOutput,
+        listOutput: result.listOutput || "",
       });
     }
-
-    // 3) Approve all pending requests (usually 1)
-    const approved = [];
-    for (const id of requestIds) {
-      const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", id]));
-      approved.push({
-        requestId: id,
-        ok: r.code === 0,
-        exitCode: r.code,
-        output: redactSecrets(r.output || ""),
-      });
-    }
-
-    return res.json({
-      ok: approved.every((x) => x.ok),
-      approved,
-      listOutput,
-    });
+    return res.status(result.ok ? 200 : 500).json(result);
   } catch (err) {
     console.error("[/setup/api/devices/auto-approve] error:", err);
     return res.status(500).json({ ok: false, error: String(err) });
@@ -884,12 +859,105 @@ function redactSecrets(text) {
 }
 
 function extractPendingUiRequestIds(output) {
-  // The "devices list" output includes a "Request" column that contains UUIDs like:
-  // 59e28ac9-d501-4bce-bb9f-19e636090fb8
-  // We should ONLY extract UUIDs (not device ids).
+  const text = output || "";
+  const ids = new Set();
+
+  // Common table output uses UUID request IDs.
   const uuidRegex =
     /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
-  return Array.from(new Set((output || "").match(uuidRegex) || []));
+  for (const id of text.match(uuidRegex) || []) {
+    ids.add(id);
+  }
+
+  // Some builds print explicit labels like `requestId: abc123-xyz`.
+  const requestLabelRegex = /requestId[:\s]+([A-Za-z0-9_-]+)/gi;
+  let m = requestLabelRegex.exec(text);
+  while (m) {
+    ids.add(m[1]);
+    m = requestLabelRegex.exec(text);
+  }
+
+  return Array.from(ids);
+}
+
+let autoApproveInFlight = null;
+let autoApproveInterval = null;
+let lastAutoApproveAt = 0;
+
+async function autoApprovePendingUiDevices() {
+  const listRes = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+  const listOutput = redactSecrets(listRes.output || "");
+
+  if (listRes.code !== 0) {
+    return {
+      ok: false,
+      error: "Failed to list devices",
+      listOutput,
+      exitCode: listRes.code,
+      approved: [],
+    };
+  }
+
+  const requestIds = extractPendingUiRequestIds(listRes.output || "");
+  if (requestIds.length === 0) {
+    return {
+      ok: true,
+      approved: [],
+      listOutput,
+      message: "No pending device requests",
+    };
+  }
+
+  const approved = [];
+  for (const id of requestIds) {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", id]));
+    approved.push({
+      requestId: id,
+      ok: r.code === 0,
+      exitCode: r.code,
+      output: redactSecrets(r.output || ""),
+    });
+  }
+
+  return {
+    ok: approved.every((x) => x.ok),
+    approved,
+    listOutput,
+  };
+}
+
+function maybeAutoApproveUiDevices(reason = "unspecified") {
+  if (!AUTO_APPROVE_UI_DEVICES || !isConfigured()) return null;
+
+  const now = Date.now();
+  if (autoApproveInFlight) return autoApproveInFlight;
+  if (now - lastAutoApproveAt < AUTO_APPROVE_COOLDOWN_MS) return null;
+  lastAutoApproveAt = now;
+
+  autoApproveInFlight = (async () => {
+    try {
+      const result = await autoApprovePendingUiDevices();
+      if (!result.ok) {
+        console.warn(
+          `[pairing:auto-approve] ${reason}: failed (${result.error || "unknown"})`,
+        );
+      } else if (result.approved.length > 0) {
+        console.log(
+          `[pairing:auto-approve] ${reason}: approved ${result.approved.length} request(s)`,
+        );
+      } else {
+        debug(`[pairing:auto-approve] ${reason}: no pending requests`);
+      }
+      return result;
+    } catch (err) {
+      console.error(`[pairing:auto-approve] ${reason}:`, err);
+      return { ok: false, error: String(err), approved: [] };
+    } finally {
+      autoApproveInFlight = null;
+    }
+  })();
+
+  return autoApproveInFlight;
 }
 
 // ========== WEB TUI: AUTH + SESSION MANAGEMENT ==========
@@ -1397,6 +1465,11 @@ app.use(async (req, res) => {
     return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
   }
 
+  if (req.path === "/openclaw" || req.path.startsWith("/openclaw/")) {
+    // Fire-and-forget: pairing request is generated by Control UI traffic.
+    maybeAutoApproveUiDevices("openclaw-request");
+  }
+
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1416,6 +1489,14 @@ const server = app.listen(PORT, () => {
   try {
     fs.chmodSync(path.join(STATE_DIR, "credentials"), 0o700);
   } catch {}
+
+  if (AUTO_APPROVE_UI_DEVICES) {
+    maybeAutoApproveUiDevices("startup");
+    autoApproveInterval = setInterval(
+      () => maybeAutoApproveUiDevices("periodic"),
+      Math.max(AUTO_APPROVE_COOLDOWN_MS, 10_000),
+    );
+  }
 
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
@@ -1486,6 +1567,10 @@ async function gracefulShutdown(signal) {
 
   if (setupRateLimiter.cleanupInterval) {
     clearInterval(setupRateLimiter.cleanupInterval);
+  }
+  if (autoApproveInterval) {
+    clearInterval(autoApproveInterval);
+    autoApproveInterval = null;
   }
 
   if (activeTuiSession) {
