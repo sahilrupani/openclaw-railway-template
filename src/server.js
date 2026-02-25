@@ -88,6 +88,36 @@ const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
 const AUTO_APPROVE_UI_DEVICES =
   process.env.AUTO_APPROVE_UI_DEVICES?.toLowerCase() === "true";
 
+function resolveAllowedOrigins() {
+  const raw = process.env.OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS?.trim();
+  if (!raw) return ["*"];
+
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const origins = parsed
+          .map((v) => String(v).trim())
+          .filter((v) => v.length > 0);
+        if (origins.length > 0) return origins;
+      }
+    } catch (err) {
+      console.warn(
+        `[gateway] invalid OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS JSON: ${err.message}; falling back to ["*"]`,
+      );
+    }
+    return ["*"];
+  }
+
+  const origins = raw
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  return origins.length > 0 ? origins : ["*"];
+}
+
+const CONTROL_UI_ALLOWED_ORIGINS = resolveAllowedOrigins();
+
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
   10,
@@ -192,6 +222,32 @@ async function startGateway() {
   console.log(`[gateway] Sync result: exit code ${syncResult.code}`);
   if (syncResult.output?.trim()) {
     console.log(`[gateway] Sync output: ${syncResult.output}`);
+  }
+
+  const allowInsecureResult = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
+  );
+  if (allowInsecureResult.code !== 0) {
+    console.warn(
+      `[gateway] failed to set gateway.controlUi.allowInsecureAuth=true (exit=${allowInsecureResult.code})`,
+    );
+  }
+
+  const allowedOriginsResult = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "--json",
+      "gateway.controlUi.allowedOrigins",
+      JSON.stringify(CONTROL_UI_ALLOWED_ORIGINS),
+    ]),
+  );
+  if (allowedOriginsResult.code !== 0) {
+    console.warn(
+      `[gateway] failed to set gateway.controlUi.allowedOrigins=${JSON.stringify(CONTROL_UI_ALLOWED_ORIGINS)} (exit=${allowedOriginsResult.code})`,
+    );
   }
 
   const args = [
@@ -773,6 +829,18 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         ]),
       );
       extra += `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`;
+
+      const allowedOriginsResult = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "--json",
+          "gateway.controlUi.allowedOrigins",
+          JSON.stringify(CONTROL_UI_ALLOWED_ORIGINS),
+        ]),
+      );
+      extra += `[config] gateway.controlUi.allowedOrigins=${JSON.stringify(CONTROL_UI_ALLOWED_ORIGINS)} exit=${allowedOriginsResult.code}\n`;
 
       const tokenResult = await runCmd(
         OPENCLAW_NODE,
