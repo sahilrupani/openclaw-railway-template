@@ -1392,6 +1392,7 @@ const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
   xfwd: true,
+  changeOrigin: true,
   proxyTimeout: 120_000,
   timeout: 120_000,
 });
@@ -1416,10 +1417,18 @@ proxy.on("error", (err, _req, res) => {
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  // Some OpenClaw builds enforce strict origin checks for Control UI routes.
+  // Normalize forwarded origin/host to internal gateway so proxied browser traffic is accepted.
+  if (req.headers.origin) {
+    proxyReq.setHeader("Origin", `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`);
+  }
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  if (req.headers.origin) {
+    proxyReq.setHeader("Origin", `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`);
+  }
 });
 
 // Auto-inject token into /openclaw browser GET requests so the Control UI works
