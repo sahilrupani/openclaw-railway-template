@@ -19,6 +19,55 @@ const WORKSPACE_DIR =
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+const LOG_FILE = path.join(STATE_DIR, "server.log");
+const LOG_RING_BUFFER_MAX = 1000;
+const MAX_LOG_FILE_SIZE = 5 * 1024 * 1024;
+const logRingBuffer = [];
+const sseClients = new Set();
+
+function writeLog(level, category, message) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] [${level}] [${category}] ${message}`;
+
+  const consoleFn =
+    level === "ERROR"
+      ? console.error
+      : level === "WARN"
+        ? console.warn
+        : console.log;
+  consoleFn(line);
+
+  logRingBuffer.push(line);
+  if (logRingBuffer.length > LOG_RING_BUFFER_MAX) {
+    logRingBuffer.shift();
+  }
+
+  for (const client of sseClients) {
+    try {
+      client.write(`data: ${JSON.stringify(line)}\n\n`);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > MAX_LOG_FILE_SIZE) {
+      const content = fs.readFileSync(LOG_FILE, "utf8");
+      const lines = content.split("\n");
+      fs.writeFileSync(LOG_FILE, lines.slice(Math.floor(lines.length / 2)).join("\n"));
+    }
+  } catch {}
+}
+
+const log = {
+  info: (category, message) => writeLog("INFO", category, message),
+  warn: (category, message) => writeLog("WARN", category, message),
+  error: (category, message) => writeLog("ERROR", category, message),
+};
+
 function resolveGatewayToken() {
   const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
   if (envTok) return envTok;
@@ -28,9 +77,7 @@ function resolveGatewayToken() {
     const existing = fs.readFileSync(tokenPath, "utf8").trim();
     if (existing) return existing;
   } catch (err) {
-    console.warn(
-      `[gateway-token] could not read existing token: ${err.code || err.message}`,
-    );
+    log.warn("gateway-token", `could not read existing token: ${err.code || err.message}`);
   }
 
   const generated = crypto.randomBytes(32).toString("hex");
@@ -38,9 +85,7 @@ function resolveGatewayToken() {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     fs.writeFileSync(tokenPath, generated, { encoding: "utf8", mode: 0o600 });
   } catch (err) {
-    console.warn(
-      `[gateway-token] could not persist token: ${err.code || err.message}`,
-    );
+    log.warn("gateway-token", `could not persist token: ${err.code || err.message}`);
   }
   return generated;
 }
@@ -70,29 +115,8 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
-function resolveOpenclawEntry() {
-  const envEntry = process.env.OPENCLAW_ENTRY?.trim();
-  const candidates = [
-    envEntry,
-    "/openclaw/dist/entry.js",
-    "/usr/local/lib/node_modules/openclaw/dist/entry.js",
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  if (envEntry) {
-    console.warn(
-      `[openclaw] OPENCLAW_ENTRY not found at ${envEntry}; falling back to ${candidates[1]}`,
-    );
-  }
-
-  // Preserve previous behavior if no candidate exists yet.
-  return candidates[1];
-}
-
-const OPENCLAW_ENTRY = resolveOpenclawEntry();
+const OPENCLAW_ENTRY =
+  process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
@@ -124,6 +148,28 @@ function isConfigured() {
   }
 }
 
+async function syncAllowedOrigins() {
+  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (!publicDomain) return;
+
+  const origin = `https://${publicDomain}`;
+  const result = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "--json",
+      "gateway.controlUi.allowedOrigins",
+      JSON.stringify([origin]),
+    ]),
+  );
+  if (result.code === 0) {
+    log.info("gateway", `set allowedOrigins to [${origin}]`);
+  } else {
+    log.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
+  }
+}
+
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
@@ -144,21 +190,21 @@ async function waitForGatewayReady(opts = {}) {
           method: "GET",
         });
         if (res) {
-          console.log(`[gateway] ready at ${endpoint}`);
+          log.info("gateway", `ready at ${endpoint}`);
           return true;
         }
       } catch (err) {
         if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
           const msg = err.code || err.message;
           if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-            console.warn(`[gateway] health check error: ${msg}`);
+            log.warn("gateway", `health check error: ${msg}`);
           }
         }
       }
     }
     await sleep(250);
   }
-  console.error(`[gateway] failed to become ready after ${timeoutMs / 1000} seconds`);
+  log.error("gateway", `failed to become ready after ${timeoutMs / 1000} seconds`);
   return false;
 }
 
@@ -169,14 +215,8 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
-  for (const lockPath of [
-    path.join(STATE_DIR, "gateway.lock"),
-    "/tmp/openclaw-gateway.lock",
-  ]) {
-    try {
-      fs.rmSync(lockPath, { force: true });
-    } catch {}
-  }
+  const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  log.info("gateway", `stop existing gateway exit=${stopResult.code}`);
 
   const args = [
     "gateway",
@@ -204,27 +244,25 @@ async function startGateway() {
   const safeArgs = args.map((arg, i) =>
     args[i - 1] === "--token" ? "[REDACTED]" : arg
   );
-  console.log(
-    `[gateway] starting with command: ${OPENCLAW_NODE} ${clawArgs(safeArgs).join(" ")}`,
-  );
-  console.log(`[gateway] STATE_DIR: ${STATE_DIR}`);
-  console.log(`[gateway] WORKSPACE_DIR: ${WORKSPACE_DIR}`);
-  console.log(`[gateway] config path: ${configPath()}`);
+  log.info("gateway", `starting with command: ${OPENCLAW_NODE} ${clawArgs(safeArgs).join(" ")}`);
+  log.info("gateway", `STATE_DIR: ${STATE_DIR}`);
+  log.info("gateway", `WORKSPACE_DIR: ${WORKSPACE_DIR}`);
+  log.info("gateway", `config path: ${configPath()}`);
 
   gatewayProc.on("error", (err) => {
-    console.error(`[gateway] spawn error: ${String(err)}`);
+    log.error("gateway", `spawn error: ${String(err)}`);
     gatewayProc = null;
   });
 
   gatewayProc.on("exit", (code, signal) => {
-    console.error(`[gateway] exited code=${code} signal=${signal}`);
+    log.error("gateway", `exited code=${code} signal=${signal}`);
     gatewayProc = null;
     if (!shuttingDown && isConfigured()) {
-      console.log("[gateway] scheduling auto-restart in 2s...");
+      log.info("gateway", "scheduling auto-restart in 2s...");
       setTimeout(() => {
         if (!shuttingDown && !gatewayProc && isConfigured()) {
           ensureGatewayRunning().catch((err) => {
-            console.error(`[gateway] auto-restart failed: ${err.message}`);
+            log.error("gateway", `auto-restart failed: ${err.message}`);
           });
         }
       }, 2000);
@@ -237,6 +275,7 @@ async function ensureGatewayRunning() {
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
+      await syncAllowedOrigins();
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
       if (!ready) {
@@ -263,7 +302,7 @@ async function restartGateway() {
     try {
       gatewayProc.kill("SIGTERM");
     } catch (err) {
-      console.warn(`[gateway] kill error: ${err.message}`);
+      log.warn("gateway", `kill error: ${err.message}`);
     }
     await sleep(750);
     gatewayProc = null;
@@ -333,6 +372,10 @@ function requireSetupAuth(req, res, next) {
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
+
+app.get("/styles.css", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
+});
 
 app.get("/healthz", async (_req, res) => {
   let gateway = "unconfigured";
@@ -693,7 +736,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           enabled: true,
           dmPolicy: "pairing",
           botToken: payload.telegramToken.trim(),
-          groupPolicy: "allowlist",
+          groupPolicy: "open",
           streamMode: "partial",
         });
       }
@@ -702,7 +745,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         extra += await configureChannel("discord", {
           enabled: true,
           token: payload.discordToken.trim(),
-          groupPolicy: "allowlist",
+          groupPolicy: "open",
           dm: { policy: "pairing" },
         });
       }
@@ -725,7 +768,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       output: `${onboard.output}${extra}`,
     });
   } catch (err) {
-    console.error("[/setup/api/run] error:", err);
+    log.error("setup", `run error: ${String(err)}`);
     return res
       .status(500)
       .json({ ok: false, output: `Internal error: ${String(err)}` });
@@ -871,7 +914,7 @@ app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
       try { fs.rmSync(tmpZip, { force: true }); } catch {}
     });
     stream.on("error", (err) => {
-      console.error("[export] stream error:", err);
+      log.error("export", `stream error: ${err.message}`);
       try { fs.rmSync(tmpZip, { force: true }); } catch {}
       if (!res.headersSent) {
         res.status(500).json({ ok: false, error: "Stream error during export." });
@@ -879,9 +922,44 @@ app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
     });
   } catch (err) {
     try { fs.rmSync(tmpZip, { force: true }); } catch {}
-    console.error("[export] error:", err);
+    log.error("export", `error: ${err.message}`);
     return res.status(500).json({ ok: false, error: `Export failed: ${err.message}` });
   }
+});
+
+app.get("/logs", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));
+});
+
+app.get("/setup/api/logs", requireSetupAuth, async (_req, res) => {
+  try {
+    const content = fs.readFileSync(LOG_FILE, "utf8");
+    const lines = content.split("\n").filter(Boolean);
+    const limit = Math.min(Number.parseInt(_req.query.lines ?? "500", 10), 5000);
+    return res.json({ ok: true, lines: lines.slice(-limit) });
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return res.json({ ok: true, lines: [] });
+    }
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/setup/api/logs/stream", requireSetupAuth, (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  for (const line of logRingBuffer) {
+    res.write(`data: ${JSON.stringify(line)}\n\n`);
+  }
+
+  sseClients.add(res);
+  req.on("close", () => {
+    sseClients.delete(res);
+  });
 });
 
 app.get("/tui", requireSetupAuth, (_req, res) => {
@@ -917,7 +995,7 @@ function createTuiWebSocketServer(httpServer) {
 
   wss.on("connection", (ws, req) => {
     const clientIp = req.socket?.remoteAddress || "unknown";
-    console.log(`[tui] session started from ${clientIp}`);
+    log.info("tui", `session started from ${clientIp}`);
 
     let ptyProcess = null;
     let idleTimer = null;
@@ -936,7 +1014,7 @@ function createTuiWebSocketServer(httpServer) {
       }
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
-        console.log("[tui] session idle timeout");
+        log.info("tui", "session idle timeout");
         ws.close(4002, "Idle timeout");
       }, TUI_IDLE_TIMEOUT_MS);
     }
@@ -944,7 +1022,7 @@ function createTuiWebSocketServer(httpServer) {
     function spawnPty(cols, rows) {
       if (ptyProcess) return;
 
-      console.log(`[tui] spawning PTY with ${cols}x${rows}`);
+      log.info("tui", `spawning PTY with ${cols}x${rows}`);
       ptyProcess = pty.spawn(OPENCLAW_NODE, clawArgs(["tui"]), {
         name: "xterm-256color",
         cols,
@@ -963,12 +1041,12 @@ function createTuiWebSocketServer(httpServer) {
       }
 
       idleTimer = setTimeout(() => {
-        console.log("[tui] session idle timeout");
+        log.info("tui", "session idle timeout");
         ws.close(4002, "Idle timeout");
       }, TUI_IDLE_TIMEOUT_MS);
 
       maxSessionTimer = setTimeout(() => {
-        console.log("[tui] max session duration reached");
+        log.info("tui", "max session duration reached");
         ws.close(4002, "Max session duration");
       }, TUI_MAX_SESSION_MS);
 
@@ -979,7 +1057,7 @@ function createTuiWebSocketServer(httpServer) {
       });
 
       ptyProcess.onExit(({ exitCode, signal }) => {
-        console.log(`[tui] PTY exited code=${exitCode} signal=${signal}`);
+        log.info("tui", `PTY exited code=${exitCode} signal=${signal}`);
         if (ws.readyState === ws.OPEN) {
           ws.close(1000, "Process exited");
         }
@@ -1002,12 +1080,12 @@ function createTuiWebSocketServer(httpServer) {
           ptyProcess.write(msg.data);
         }
       } catch (err) {
-        console.warn(`[tui] invalid message: ${err.message}`);
+        log.warn("tui", `invalid message: ${err.message}`);
       }
     });
 
     ws.on("close", () => {
-      console.log("[tui] session closed");
+      log.info("tui", "session closed");
       clearTimeout(idleTimer);
       clearTimeout(maxSessionTimer);
       if (ptyProcess) {
@@ -1019,7 +1097,7 @@ function createTuiWebSocketServer(httpServer) {
     });
 
     ws.on("error", (err) => {
-      console.error(`[tui] WebSocket error: ${err.message}`);
+      log.error("tui", `WebSocket error: ${err.message}`);
     });
   });
 
@@ -1036,7 +1114,7 @@ const proxy = httpProxy.createProxyServer({
 });
 
 proxy.on("error", (err, _req, res) => {
-  console.error("[proxy]", err);
+  log.error("proxy", String(err));
   if (res && typeof res.headersSent !== "undefined" && !res.headersSent) {
     res.writeHead(503, { "Content-Type": "text/html" });
     try {
@@ -1051,14 +1129,18 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
+const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : GATEWAY_TARGET;
+
 proxy.on("proxyReq", (proxyReq, req, res) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
-  proxyReq.setHeader("Origin", GATEWAY_TARGET);
+  proxyReq.setHeader("Origin", PROXY_ORIGIN);
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
-  proxyReq.setHeader("Origin", GATEWAY_TARGET);
+  proxyReq.setHeader("Origin", PROXY_ORIGIN);
 });
 
 app.use(async (req, res) => {
@@ -1092,24 +1174,24 @@ app.use(async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[wrapper] listening on port ${PORT}`);
-  console.log(`[wrapper] setup wizard: http://localhost:${PORT}/setup`);
-  console.log(`[wrapper] web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
-  console.log(`[wrapper] configured: ${isConfigured()}`);
+  log.info("wrapper", `listening on port ${PORT}`);
+  log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
+  log.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
+  log.info("wrapper", `configured: ${isConfigured()}`);
 
   if (isConfigured()) {
     (async () => {
       try {
-        console.log("[wrapper] running openclaw doctor --fix...");
+        log.info("wrapper", "running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
-        console.log(`[wrapper] doctor --fix exit=${dr.code}`);
-        if (dr.output) console.log(dr.output);
+        log.info("wrapper", `doctor --fix exit=${dr.code}`);
+        if (dr.output) log.info("wrapper", dr.output);
       } catch (err) {
-        console.warn(`[wrapper] doctor --fix failed: ${err.message}`);
+        log.warn("wrapper", `doctor --fix failed: ${err.message}`);
       }
       await ensureGatewayRunning();
     })().catch((err) => {
-      console.error(`[wrapper] failed to start gateway at boot: ${err.message}`);
+      log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     });
   }
 });
@@ -1151,7 +1233,7 @@ server.on("upgrade", async (req, socket, head) => {
   try {
     await ensureGatewayRunning();
   } catch (err) {
-    console.warn(`[websocket] gateway not ready: ${err.message}`);
+    log.warn("websocket", `gateway not ready: ${err.message}`);
     socket.destroy();
     return;
   }
@@ -1159,7 +1241,7 @@ server.on("upgrade", async (req, socket, head) => {
 });
 
 async function gracefulShutdown(signal) {
-  console.log(`[wrapper] received ${signal}, shutting down`);
+  log.info("wrapper", `received ${signal}, shutting down`);
   shuttingDown = true;
 
   if (setupRateLimiter.cleanupInterval) {
@@ -1187,7 +1269,7 @@ async function gracefulShutdown(signal) {
         gatewayProc.kill("SIGKILL");
       }
     } catch (err) {
-      console.warn(`[wrapper] error killing gateway: ${err.message}`);
+      log.warn("wrapper", `error killing gateway: ${err.message}`);
     }
   }
 
