@@ -4,6 +4,8 @@ OpenClaw is an open-source personal AI assistant platform with 328,000+ GitHub s
 
 **One gateway. Every chat app. Any AI model. Your infrastructure.**
 
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/openclaw-prev-clawdbot-moltbot-easy-self)
+
 ## About Hosting OpenClaw
 
 This template wraps OpenClaw in a production-ready container with a browser-based setup wizard at `/setup`, a web terminal at `/tui`, and a full admin dashboard — all protected by a password you set at deploy time. Your config, credentials, conversation history, and workspace files persist on a Railway Volume so nothing is lost on redeploys.
@@ -44,6 +46,8 @@ Open WebUI is a self-hosted chat interface — a browser-based front end for tal
 - **Web Terminal (TUI)** at `/tui` — run `openclaw` CLI commands from your browser
 - **Device Management** — approve and revoke paired devices from the dashboard
 - **Persistent Railway Volume** — config, credentials, and memory survive every redeploy
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/openclaw-prev-clawdbot-moltbot-easy-self)
 
 ![OpenClaw Web Terminal](https://github.com/user-attachments/assets/61147ec2-ddd5-4b5b-b9ac-0dd81a1ae4c7)
 
