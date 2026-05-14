@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>🦞 OpenClaw — Personal AI Assistant</title>
   <link rel="stylesheet" href="/styles.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script>
   document.addEventListener('alpine:init', () => {
     Alpine.data('setupApp', () => ({
@@ -21,20 +18,36 @@
       authChoices: [],
       selectedAuth: '',
       authSecret: '',
+      customBaseUrl: '',
+      customModelId: '',
+      customCompatibility: 'openai',
+      cloudflareAccountId: '',
+      cloudflareGatewayId: '',
       telegramToken: '',
       discordToken: '',
       slackBotToken: '',
       slackAppToken: '',
       model: '',
       log: '',
+      loginUrl: '',
+      loginCode: '',
+      setupError: '',
+      setupStreamTail: '',
       loading: false,
       pairingChannel: '',
       pairingCode: '',
+      pairingSubmitting: false,
+      pairingResult: '',
+      pairingMessage: '',
       showPairingModal: false,
       isReady: false,
       tuiEnabled: false,
       exporting: false,
       showExportInfo: false,
+      importing: false,
+      showImportModal: false,
+      pendingImportFile: null,
+      importArchivePassword: '',
       showDevicesModal: false,
       devicesLoading: false,
       devices: [],
@@ -43,6 +56,31 @@
 
       get currentGroup() {
         return this.authGroups.find(g => g.value === this.selectedGroup);
+      },
+
+      get authRequiresSecret() {
+        return ![
+          'openai-codex',
+          'openai-codex-device-code',
+          'google-gemini-cli',
+          'github-copilot',
+          'ollama',
+          'vllm',
+          'sglang'
+        ].includes(this.selectedAuth);
+      },
+
+      get authGuidance() {
+        if (this.selectedAuth === 'openai-codex-device-code') {
+          return 'Run setup, then open the ChatGPT/Codex URL and enter the device code shown in the log.';
+        }
+        if (this.selectedAuth === 'openai-codex') {
+          return 'Browser login needs an interactive terminal to paste the redirect URL. Device pairing is recommended here.';
+        }
+        if (!this.authRequiresSecret) {
+          return 'No API key is needed for this auth method.';
+        }
+        return '';
       },
 
       async init() {
@@ -72,9 +110,6 @@
             this.selectedGroup = this.authGroups[0].value;
             this.updateAuthChoices();
           }
-          if (j.channelsAddHelp && j.channelsAddHelp.indexOf('telegram') === -1) {
-            this.log += '\nNote: this openclaw build does not list telegram in `channels add --help`. Telegram auto-add will be skipped.\n';
-          }
           this.isReady = true;
         } catch (e) {
           this.status = 'Error: ' + String(e);
@@ -99,10 +134,19 @@
       },
 
       async runSetup() {
+        this.loginUrl = '';
+        this.loginCode = '';
+        this.setupError = '';
+        this.setupStreamTail = '';
         const payload = {
           authChoice: this.selectedAuth,
           authSecret: this.authSecret,
           model: this.model,
+          customBaseUrl: this.customBaseUrl,
+          customModelId: this.customModelId,
+          customCompatibility: this.customCompatibility,
+          cloudflareAccountId: this.cloudflareAccountId,
+          cloudflareGatewayId: this.cloudflareGatewayId,
           telegramToken: this.telegramToken,
           discordToken: this.discordToken,
           slackBotToken: this.slackBotToken,
@@ -119,36 +163,86 @@
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(payload)
           });
-          const text = await res.text();
-          let j;
-          try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
-          this.log += (j.output || JSON.stringify(j, null, 2));
+          if (res.body) {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              this.processSetupChunk(decoder.decode(value, { stream: true }));
+              this.$nextTick(() => {
+                const el = this.$refs.setupLog;
+                if (el) el.scrollTop = el.scrollHeight;
+              });
+            }
+            this.processSetupChunk(decoder.decode());
+          } else {
+            this.processSetupChunk(await res.text());
+          }
+          if (!res.ok && !this.setupError) {
+            this.setupError = 'Setup request failed with HTTP ' + res.status + '.';
+          }
           await this.refreshStatus();
         } catch (e) {
-          this.log += '\nError: ' + String(e) + '\n';
+          this.setupError = 'Setup request failed.';
+          this.processSetupChunk('\nError: ' + String(e) + '\n');
         } finally {
           this.loading = false;
+        }
+      },
+
+      processSetupChunk(chunk) {
+        if (!chunk) return;
+        this.log += chunk;
+        const scanText = this.setupStreamTail + chunk;
+        this.setupStreamTail = scanText.slice(-1000);
+        this.extractLoginDetails(scanText);
+        this.extractSetupFailure(scanText);
+      },
+
+      extractLoginDetails(text) {
+        const urlMatch = text.match(/https:\/\/auth\.openai\.com\/codex\/device[^\s)]*/);
+        if (urlMatch) this.loginUrl = urlMatch[0];
+
+        const codeMatches = [...text.matchAll(/\bCode:\s*([A-Z0-9][A-Z0-9-]{3,})\b/g)];
+        const visibleCode = codeMatches.map(m => m[1]).find(code => code !== 'shown');
+        if (visibleCode) this.loginCode = visibleCode;
+      },
+
+      extractSetupFailure(text) {
+        if (text.includes('[setup] Internal error')) {
+          this.setupError = 'Setup hit an internal error. Review the log below.';
+        } else if (text.includes('[setup] Failed')) {
+          this.setupError = 'Setup failed. Review the log below.';
         }
       },
 
       openPairingModal() {
         this.pairingChannel = '';
         this.pairingCode = '';
+        this.pairingSubmitting = false;
+        this.pairingResult = '';
+        this.pairingMessage = '';
         this.showPairingModal = true;
       },
 
       async approvePairing() {
+        if (this.pairingSubmitting) return;
         const channel = this.pairingChannel.trim().toLowerCase();
         if (channel !== 'telegram' && channel !== 'discord') {
-          alert('Channel must be "telegram" or "discord"');
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Choose Telegram or Discord before approving.';
           return;
         }
         const code = this.pairingCode.trim();
         if (!code) {
-          alert('Please enter a pairing code');
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Enter the pairing code from the channel message.';
           return;
         }
-        this.showPairingModal = false;
+        this.pairingSubmitting = true;
+        this.pairingResult = 'pending';
+        this.pairingMessage = 'Approving channel access...';
         this.log += '\nApproving pairing for ' + channel + '...\n';
 
         try {
@@ -162,17 +256,21 @@
           let result;
           try { result = JSON.parse(t); } catch (_e) { result = { ok: false, output: t }; }
           if (result.ok) {
-            const msg = result.output || 'Pairing approved successfully';
-            this.log += '✓ ' + msg + '\n';
-            alert('✓ ' + msg.trim());
+            this.pairingResult = 'success';
+            this.pairingMessage = result.message || 'Channel access approved.';
+            this.log += '✓ ' + this.pairingMessage + '\n';
           } else {
-            const msg = result.output || result.error || 'Unknown error';
-            this.log += '✗ Failed: ' + msg + '\n';
-            alert('✗ Pairing failed: ' + msg.trim());
+            this.pairingResult = 'error';
+            this.pairingMessage = result.message || result.error || 'Channel approval failed.';
+            this.log += '✗ Pairing failed: ' + this.pairingMessage + '\n';
           }
+          if (result.output) this.log += result.output.trim() + '\n';
         } catch (e) {
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Channel approval request failed. Check your connection and try again.';
           this.log += '✗ Error: ' + String(e) + '\n';
-          alert('✗ Pairing failed: ' + String(e));
+        } finally {
+          this.pairingSubmitting = false;
         }
       },
 
@@ -256,6 +354,63 @@
         }
       },
 
+      onImportFileSelected(event) {
+        const f = event.target.files && event.target.files[0];
+        event.target.value = '';
+        if (!f) return;
+        this.pendingImportFile = f;
+        this.importArchivePassword = '';
+        this.showImportModal = true;
+      },
+
+      cancelImport() {
+        if (this.importing) return;
+        this.showImportModal = false;
+        this.pendingImportFile = null;
+        this.importArchivePassword = '';
+      },
+
+      async confirmImport() {
+        const f = this.pendingImportFile;
+        if (!f) return;
+
+        const headers = { 'content-type': 'application/zip' };
+        const pw = (this.importArchivePassword || '').trim();
+        if (pw) {
+          headers['x-archive-password'] = btoa(unescape(encodeURIComponent(pw)));
+        }
+
+        this.importing = true;
+        this.log = 'Uploading ' + f.name + ' (' + f.size + ' bytes)...\n';
+
+        try {
+          const buf = await f.arrayBuffer();
+          const res = await fetch('/setup/api/import', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers,
+            body: buf,
+          });
+          const text = await res.text();
+          let j;
+          try { j = JSON.parse(text); } catch (_e) { j = { ok: res.ok, output: text }; }
+          if (j.output) this.log += j.output + '\n';
+          if (res.ok && j.ok) {
+            this.log += '✓ Import complete. Gateway restarted.\n';
+            this.showImportModal = false;
+            this.pendingImportFile = null;
+            this.importArchivePassword = '';
+            await this.refreshStatus();
+          } else {
+            this.log += '✗ Import failed: ' + (j.error || text) + '\n';
+          }
+        } catch (e) {
+          this.log += '✗ Import error: ' + String(e) + '\n';
+        } finally {
+          this.importing = false;
+        }
+      },
+
       async openDevicesModal() {
         this.showDevicesModal = true;
         await this.loadDevices();
@@ -277,9 +432,6 @@
           } else {
             this.devicesPending = [];
             this.devicesPaired = [];
-          }
-          if (j.raw) {
-            this.log += '[devices] ' + j.raw.trim() + '\n';
           }
         } catch (e) {
           this.log += '✗ Failed to load devices: ' + String(e) + '\n';
@@ -346,8 +498,12 @@
         <img src="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.png" alt="OpenClaw" class="logo-img">
       </picture>
     </div>
-    <h1 class="page-title">Personal AI Assistant</h1>
-    <p class="page-subtitle">Configure your AI assistant in a few simple steps</p>
+    <div style="margin-bottom:1.5rem;padding:0.75rem 1rem;border:1px solid #ef4444;border-radius:0.5rem;background:var(--bg-card)">
+      <p style="font-size:0.75rem;color:var(--text-mid);line-height:1.5;margin:0">
+        <strong style="color:#ef4444">Important:</strong> This template exposes your OpenClaw gateway to the public internet. <strong style="color:var(--text)">Please read the <a href="https://docs.openclaw.ai/gateway/security" target="_blank" style="color:var(--text);text-decoration:underline">OpenClaw security documentation</a> before deploying.</strong> If you only use chat channels (Telegram, Discord, Slack) and don't need the gateway dashboard, you can remove the public endpoint from Railway after setup.
+      </p>
+    </div>
+
 
     <div class="card card-compact mb-6">
       <div class="card-header">
@@ -445,6 +601,24 @@
             </button>
           </div>
 
+          <div class="action-card action-violet">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+              </div>
+              <span class="action-title">Import Data</span>
+            </div>
+            <p class="action-desc">Restore from a password-protected ZIP. Overwrites config and workspace, then restarts the gateway.</p>
+            <input x-ref="importInput" @change="onImportFileSelected($event)" type="file" accept=".zip,application/zip" style="display:none" />
+            <button @click="$refs.importInput.click()" :disabled="loading || importing || exporting" class="action-btn">
+              <span x-show="!importing">Import Data</span>
+              <span x-show="importing" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem">
+                <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                Importing...
+              </span>
+            </button>
+          </div>
+
           <div class="action-card action-blue">
             <div class="action-card-header">
               <div class="action-icon">
@@ -455,6 +629,19 @@
             <p class="action-desc">Stream server logs in real-time for debugging and monitoring.</p>
             <a href="/logs" target="_blank" class="action-btn" style="display:block;text-align:center;text-decoration:none">
               View Logs
+            </a>
+          </div>
+
+          <div class="action-card action-violet">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+              </div>
+              <span class="action-title">Edit Config</span>
+            </div>
+            <p class="action-desc">Directly edit <code>openclaw.json</code>. Creates a backup and restarts the gateway on save.</p>
+            <a href="/setup/config" class="action-btn" style="display:block;text-align:center;text-decoration:none">
+              Edit Config
             </a>
           </div>
         </div>
@@ -513,16 +700,50 @@
                 <option :value="o.value" x-text="o.label + (o.hint ? ' — ' + o.hint : '')"></option>
               </template>
             </select>
+            <p x-show="authGuidance" class="form-hint" x-text="authGuidance"></p>
           </div>
 
-          <div class="form-group">
+          <div class="form-group" x-show="authRequiresSecret">
             <label class="label">API Key / Token</label>
             <input x-model="authSecret" type="password" placeholder="Paste your API key or token" class="input" />
           </div>
 
+          <template x-if="selectedAuth === 'custom-api-key'">
+            <div>
+              <div class="form-group">
+                <label class="label">Base URL</label>
+                <input x-model="customBaseUrl" type="text" placeholder="e.g. https://api.example.com/v1" class="input" />
+              </div>
+              <div class="form-group">
+                <label class="label">Model ID</label>
+                <input x-model="customModelId" type="text" placeholder="e.g. my-model-id" class="input" />
+              </div>
+              <div class="form-group">
+                <label class="label">API Compatibility</label>
+                <select x-model="customCompatibility" class="select">
+                  <option value="openai">OpenAI-compatible</option>
+                  <option value="anthropic">Anthropic-compatible</option>
+                </select>
+              </div>
+            </div>
+          </template>
+
+          <template x-if="selectedAuth === 'cloudflare-ai-gateway-api-key'">
+            <div>
+              <div class="form-group">
+                <label class="label">Account ID</label>
+                <input x-model="cloudflareAccountId" type="text" placeholder="Cloudflare Account ID" class="input" />
+              </div>
+              <div class="form-group">
+                <label class="label">Gateway ID</label>
+                <input x-model="cloudflareGatewayId" type="text" placeholder="Cloudflare AI Gateway ID" class="input" />
+              </div>
+            </div>
+          </template>
+
           <div class="form-group">
             <label class="label">Model</label>
-            <input x-model="model" type="text" placeholder="e.g. openai/gpt-4.1, anthropic/claude-sonnet-4" class="input" />
+            <input x-model="model" type="text" placeholder="e.g. openai-codex/gpt-5.5, openai/gpt-4.1" class="input" />
             <p class="form-hint">Format: provider/model-name</p>
           </div>
         </div>
@@ -619,7 +840,17 @@
             </button>
           </div>
 
-          <div x-show="log" class="log-output" x-text="log"></div>
+          <div x-show="loginUrl || loginCode" class="login-code-panel">
+            <div>
+              <p class="login-code-label">ChatGPT Login</p>
+              <a x-show="loginUrl" :href="loginUrl" target="_blank" rel="noopener noreferrer" class="login-code-url" x-text="loginUrl"></a>
+            </div>
+            <div x-show="loginCode" class="login-code-value" x-text="loginCode"></div>
+          </div>
+
+          <div x-show="setupError" class="setup-error-panel" x-text="setupError"></div>
+
+          <div x-show="log" x-ref="setupLog" class="log-output" x-text="log"></div>
 
           <p class="text-xs text-muted mt-4">Reset deletes the config file so you can rerun onboarding. Channel access approval grants DM access when dmPolicy=pairing.</p>
         </div>
@@ -729,12 +960,45 @@
       </div>
     </div>
 
-    <div x-show="showPairingModal" x-cloak class="modal-overlay" @click.self="showPairingModal = false">
+    <div x-show="showImportModal" x-cloak class="modal-overlay" @click.self="cancelImport()">
+      <div class="modal-card modal-md">
+        <h3 class="modal-title mb-4">Import Backup</h3>
+        <p class="text-sm text-muted mb-4">
+          Restoring <strong x-text="pendingImportFile?.name"></strong>
+          (<span x-text="pendingImportFile ? Math.round(pendingImportFile.size / 1024) + ' KB' : ''"></span>).
+          This overwrites your config and workspace under <code>/data</code>, then restarts the gateway.
+        </p>
+        <div class="form-group">
+          <label class="label">Archive password</label>
+          <input
+            x-model="importArchivePassword"
+            type="password"
+            autocomplete="off"
+            placeholder="Leave blank to use this instance's SETUP_PASSWORD"
+            :disabled="importing"
+            class="input"
+          />
+          <p class="text-sm text-muted" style="margin-top:0.25rem">Use the SETUP_PASSWORD of the instance the backup was exported from. Leave blank if it was this instance.</p>
+        </div>
+        <div class="btn-pair">
+          <button @click="confirmImport()" :disabled="importing" class="btn btn-primary">
+            <span x-show="!importing">Import &amp; Restart</span>
+            <span x-show="importing" style="display:inline-flex;align-items:center;gap:0.5rem">
+              <span class="spinner spinner-inline" aria-hidden="true"></span>
+              Importing
+            </span>
+          </button>
+          <button @click="cancelImport()" :disabled="importing" class="btn btn-close-full" style="margin-top:0">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div x-show="showPairingModal" x-cloak class="modal-overlay" @click.self="if (!pairingSubmitting) showPairingModal = false">
       <div class="modal-card modal-sm">
         <h3 class="modal-title mb-4">Approve Channel Access</h3>
         <div class="form-group">
           <label class="label">Channel</label>
-          <select x-model="pairingChannel" class="select">
+          <select x-model="pairingChannel" @change="pairingResult = ''; pairingMessage = ''" :disabled="pairingSubmitting" class="select">
             <option value="">Select channel...</option>
             <option value="telegram">Telegram</option>
             <option value="discord">Discord</option>
@@ -742,11 +1006,21 @@
         </div>
         <div class="form-group">
           <label class="label">Pairing Code</label>
-          <input x-model="pairingCode" type="text" placeholder="e.g. 3EY4PUYS" class="input" />
+          <input x-model="pairingCode" @input="pairingResult = ''; pairingMessage = ''" :disabled="pairingSubmitting" type="text" placeholder="e.g. 3EY4PUYS" class="input" />
+        </div>
+        <div x-show="pairingResult" x-cloak role="status" aria-live="polite" class="pairing-status" :class="'pairing-status-' + pairingResult">
+          <span x-show="pairingResult === 'pending'" class="spinner spinner-inline" aria-hidden="true"></span>
+          <span x-text="pairingMessage"></span>
         </div>
         <div class="btn-pair">
-          <button @click="approvePairing()" class="btn btn-primary">Approve</button>
-          <button @click="showPairingModal = false" class="btn btn-close-full" style="margin-top:0">Cancel</button>
+          <button @click="approvePairing()" :disabled="pairingSubmitting || pairingResult === 'success'" class="btn btn-primary">
+            <span x-show="!pairingSubmitting">Approve</span>
+            <span x-show="pairingSubmitting" style="display:inline-flex;align-items:center;gap:0.5rem">
+              <span class="spinner spinner-inline" aria-hidden="true"></span>
+              Approving
+            </span>
+          </button>
+          <button @click="showPairingModal = false" :disabled="pairingSubmitting" class="btn btn-close-full" style="margin-top:0" x-text="pairingResult === 'success' ? 'Close' : 'Cancel'"></button>
         </div>
       </div>
     </div>

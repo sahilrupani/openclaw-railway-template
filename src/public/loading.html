@@ -3,12 +3,30 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="3">
-  <title>🦞 OpenClaw — Starting Up</title>
+  <title>OpenClaw</title>
   <link rel="stylesheet" href="/styles.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    .fade-out { opacity: 0; transition: opacity 0.4s ease; }
+    .fade-in { opacity: 1; transition: opacity 0.4s ease; }
+    .hidden { display: none; }
+    .countdown-text { font-size: 1rem; color: var(--text-secondary); margin-top: 0.5rem; }
+    .setup-link {
+      display: inline-block;
+      margin-top: 1.5rem;
+      padding: 0.5rem 1.25rem;
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      text-decoration: none;
+      transition: background 0.2s, color 0.2s;
+    }
+    .setup-link:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+  </style>
 </head>
 <body class="loading-center">
   <div class="loading-inner">
@@ -18,9 +36,66 @@
         <img src="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.png" alt="OpenClaw" class="logo-img-sm">
       </picture>
     </div>
-    <div class="spinner spinner-lg spinner-red"></div>
-    <h1 class="loading-title">OpenClaw is starting up</h1>
-    <p class="loading-subtitle">This page will auto-refresh when the gateway is ready.</p>
+
+    <div id="state-loading">
+      <div class="spinner spinner-lg spinner-red"></div>
+      <h1 class="loading-title">OpenClaw is starting up</h1>
+      <p class="loading-subtitle">Please wait while the gateway initializes.</p>
+    </div>
+
+    <div id="state-ready" class="hidden">
+      <h1 class="loading-title">Redirecting to OpenClaw dashboard</h1>
+      <p class="countdown-text">Redirecting in <span id="countdown">10</span> seconds...</p>
+      <div style="display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem;">
+        <a href="/openclaw" class="setup-link" style="background: #dc2626; color: #fff; border-color: #dc2626;">Open Dashboard</a>
+        <a href="/setup" class="setup-link">Enter Setup</a>
+      </div>
+    </div>
   </div>
+
+  <script>
+    const stateLoading = document.getElementById("state-loading");
+    const stateReady = document.getElementById("state-ready");
+    const countdownEl = document.getElementById("countdown");
+    let redirecting = false;
+
+    async function checkStatus() {
+      try {
+        const res = await fetch("/healthz");
+        const data = await res.json();
+
+        if (data.gateway === "unconfigured") {
+          window.location.href = "/setup";
+          return;
+        }
+
+        if (data.gateway === "ready" && !redirecting) {
+          redirecting = true;
+          stateLoading.classList.add("hidden");
+          stateReady.classList.remove("hidden");
+          startCountdown();
+          return;
+        }
+      } catch {}
+
+      if (!redirecting) {
+        setTimeout(checkStatus, 2000);
+      }
+    }
+
+    function startCountdown() {
+      let seconds = 10;
+      const timer = setInterval(() => {
+        seconds--;
+        countdownEl.textContent = seconds;
+        if (seconds <= 0) {
+          clearInterval(timer);
+          window.location.href = "/openclaw";
+        }
+      }, 1000);
+    }
+
+    checkStatus();
+  </script>
 </body>
 </html>

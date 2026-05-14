@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🦞 OpenClaw — Config Editor</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.data('configApp', () => ({
+      path: '',
+      exists: false,
+      content: '',
+      loading: false,
+      saving: false,
+      message: '',
+      error: '',
+
+      async init() {
+        await this.load();
+      },
+
+      async httpJson(url, opts = {}) {
+        opts.credentials = 'same-origin';
+        const res = await fetch(url, opts);
+        const text = await res.text();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch { /* leave null */ }
+        if (!res.ok) {
+          const err = (body && body.error) || text || res.statusText;
+          throw new Error('HTTP ' + res.status + ': ' + err);
+        }
+        return body;
+      },
+
+      async load() {
+        this.loading = true;
+        this.error = '';
+        this.message = '';
+        try {
+          const j = await this.httpJson('/setup/api/config/raw');
+          this.path = j.path || '';
+          this.exists = !!j.exists;
+          this.content = j.content || '';
+        } catch (e) {
+          this.error = String(e.message || e);
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      async save() {
+        this.error = '';
+        this.message = '';
+        try {
+          JSON.parse(this.content);
+        } catch (e) {
+          this.error = 'Invalid JSON: ' + (e.message || String(e));
+          return;
+        }
+        if (!confirm('Save config and restart the gateway? A timestamped .bak backup will be created next to openclaw.json.')) {
+          return;
+        }
+        this.saving = true;
+        try {
+          const j = await this.httpJson('/setup/api/config/raw', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: this.content })
+          });
+          let msg = 'Saved to ' + (j.path || this.path) + '.';
+          if (j.backupPath) msg += '\nBackup: ' + j.backupPath;
+          msg += j.restarted ? '\nGateway restarted.' : '\nGateway not running — no restart needed.';
+          this.message = msg;
+          this.exists = true;
+        } catch (e) {
+          this.error = String(e.message || e);
+        } finally {
+          this.saving = false;
+        }
+      },
+    }));
+  });
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+</head>
+<body x-data="configApp()">
+  <div class="container">
+    <div class="logo-wrap">
+      <picture>
+        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.png">
+        <img src="https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.png" alt="OpenClaw" class="logo-img">
+      </picture>
+    </div>
+
+    <div style="margin-bottom:1.25rem">
+      <a href="/setup" class="inline-link" style="font-size:0.875rem">← Back to Setup</a>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Config Editor</h2>
+          <p class="card-subtitle">Direct edit of <code>openclaw.json</code>. Saving creates a timestamped <code>.bak</code> backup and restarts the gateway.</p>
+        </div>
+      </div>
+
+      <p class="form-hint" style="margin-bottom:0.75rem">
+        <strong>File:</strong>
+        <span x-text="path || '(loading…)'"></span>
+        <span x-show="!loading && !exists" style="color:var(--text-muted)">(does not exist yet)</span>
+      </p>
+
+      <textarea
+        class="config-textarea"
+        x-model="content"
+        :disabled="loading || saving"
+        spellcheck="false"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+      ></textarea>
+
+      <div class="btn-row" style="margin-top:1rem;display:flex;gap:0.75rem;flex-wrap:wrap">
+        <button @click="load()" :disabled="loading || saving" class="btn btn-secondary">
+          <span x-show="!loading">Reload</span>
+          <span x-show="loading" style="display:inline-flex;align-items:center;gap:0.5rem">
+            <span class="spinner spinner-inline" aria-hidden="true"></span>
+            Loading
+          </span>
+        </button>
+        <button @click="save()" :disabled="loading || saving" class="btn btn-primary">
+          <span x-show="!saving">Save &amp; Restart Gateway</span>
+          <span x-show="saving" style="display:inline-flex;align-items:center;gap:0.5rem">
+            <span class="spinner spinner-inline" aria-hidden="true"></span>
+            Saving
+          </span>
+        </button>
+      </div>
+
+      <div x-show="error" x-cloak class="setup-error-panel" style="margin-top:1rem" x-text="error"></div>
+      <div x-show="message" x-cloak class="log-output" style="margin-top:1rem" x-text="message"></div>
+    </div>
+  </div>
+</body>
+</html>

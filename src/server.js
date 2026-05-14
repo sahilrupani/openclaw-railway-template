@@ -1,13 +1,19 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import express from "express";
 import httpProxy from "http-proxy";
 import pty from "node-pty";
 import { WebSocketServer } from "ws";
+import {
+  canServeGatewayRequest,
+  describeGatewayHealth,
+} from "./gateway-readiness.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -18,8 +24,6 @@ const WORKSPACE_DIR =
   path.join(STATE_DIR, "workspace");
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
-const CONTROL_UI_ALLOWED_ORIGINS =
-  process.env.OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS?.trim() || "";
 
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
@@ -96,24 +100,21 @@ const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
 process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
 
 let cachedOpenclawVersion = null;
-let cachedChannelsHelp = null;
 
 async function getOpenclawInfo() {
   if (!cachedOpenclawVersion) {
-    const [version, channelsHelp] = await Promise.all([
-      runCmd(OPENCLAW_NODE, clawArgs(["--version"])),
-      runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"])),
-    ]);
+    const version = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
     cachedOpenclawVersion = version.output.trim();
-    cachedChannelsHelp = channelsHelp.output;
   }
-  return { version: cachedOpenclawVersion, channelsHelp: cachedChannelsHelp };
+  return { version: cachedOpenclawVersion };
 }
 
 const INTERNAL_GATEWAY_PORT = Number.parseInt(
   process.env.INTERNAL_GATEWAY_PORT ?? "18789",
   10,
 );
+// This is the wrapper's upstream target host, not an OpenClaw --bind mode.
+// Railway exposes the Express wrapper on PORT; the gateway stays private.
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
@@ -133,6 +134,105 @@ const TUI_MAX_SESSION_MS = Number.parseInt(
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
+}
+
+function stripAnsi(value) {
+  return String(value)
+    .replace(/\x1b\]8;;.*?\x1b\\|\x1b\]8;;\x1b\\/g, "")
+    .replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]/g, "");
+}
+
+function isTransientProgressLine(line) {
+  return /^[\s◐◓◑◒⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.-]*(Requesting device code|Waiting for device authorization|Exchanging device code)/.test(
+    line,
+  );
+}
+
+function cleanPtyOutput(value) {
+  const cleaned = stripAnsi(value)
+    .split(/\r|\n/)
+    .filter((line) => line && !isTransientProgressLine(line))
+    .join("\n");
+  return cleaned ? `${cleaned}\n` : "";
+}
+
+let deviceBootstrapSdkPromise = null;
+
+function resolveDeviceBootstrapSdkPath() {
+  const entryPath = path.resolve(OPENCLAW_ENTRY);
+  try {
+    const requireFromOpenclaw = createRequire(entryPath);
+    return requireFromOpenclaw.resolve("openclaw/plugin-sdk/device-bootstrap");
+  } catch {
+    const openclawRoot = path.dirname(path.dirname(entryPath));
+    return path.join(openclawRoot, "dist", "plugin-sdk", "device-bootstrap.js");
+  }
+}
+
+async function loadDeviceBootstrapSdk() {
+  if (!deviceBootstrapSdkPromise) {
+    deviceBootstrapSdkPromise = import(
+      pathToFileURL(resolveDeviceBootstrapSdkPath()).href
+    ).catch((err) => {
+      deviceBootstrapSdkPromise = null;
+      throw err;
+    });
+  }
+  return deviceBootstrapSdkPromise;
+}
+
+async function probeDeviceBootstrapSdk() {
+  try {
+    await loadDeviceBootstrapSdk();
+    log.info(
+      "devices",
+      `device bootstrap SDK ready: ${resolveDeviceBootstrapSdkPath()}`,
+    );
+  } catch (err) {
+    log.warn(
+      "devices",
+      `device bootstrap SDK unavailable at startup (${resolveDeviceBootstrapSdkPath()}): ${err?.message || String(err)}`,
+    );
+  }
+}
+
+function devicePairingTimestamp(request) {
+  const ts = request?.ts;
+  if (typeof ts === "number") return ts;
+  if (typeof ts === "string") {
+    const parsed = Date.parse(ts);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+function newestPendingDevicePairing(pending) {
+  if (!Array.isArray(pending) || pending.length === 0) return null;
+  return pending.reduce((latest, current) =>
+    devicePairingTimestamp(current) > devicePairingTimestamp(latest)
+      ? current
+      : latest,
+  );
+}
+
+function describeDeviceApprovalForbidden(result) {
+  const scope = result?.scope || "unknown";
+  const role = result?.role || "unknown";
+
+  switch (result?.reason) {
+    case "caller-scopes-required":
+      return `missing scope: ${scope}`;
+    case "caller-missing-scope":
+      return `missing scope: ${scope}`;
+    case "scope-outside-requested-roles":
+      return `invalid scope for requested roles: ${scope}`;
+    case "bootstrap-role-not-allowed":
+      return `bootstrap profile does not allow role: ${role}`;
+    case "bootstrap-scope-not-allowed":
+      return `bootstrap profile does not allow scope: ${scope}`;
+    default:
+      return "Device approval is forbidden by bootstrap policy.";
+  }
 }
 
 function configPath() {
@@ -155,6 +255,15 @@ async function syncAllowedOrigins() {
   if (!publicDomain) return;
 
   const origin = `https://${publicDomain}`;
+
+  const current = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "get", "gateway.controlUi.allowedOrigins"]),
+  );
+  if (current.code === 0 && current.output.includes(origin)) {
+    return;
+  }
+
   const result = await runCmd(
     OPENCLAW_NODE,
     clawArgs([
@@ -175,142 +284,57 @@ async function syncAllowedOrigins() {
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
+let gatewayRestartCount = 0;
+let gatewayLastStartTime = 0;
+let intentionalRestart = false;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function parseOrigins(raw) {
-  const value = raw?.trim();
-  if (!value) return [];
+async function probeGatewayOnce(opts = {}) {
+  const endpoints = ["/openclaw", "/", "/health"];
+  const timeoutMs = opts.timeoutMs ?? 2000;
 
-  if (value.startsWith("[")) {
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        return parsed.map((v) => String(v));
+      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      if (res.status < 500) {
+        return { ok: true, endpoint };
       }
-    } catch {}
-  }
-
-  return value
-    .split(/[\s,]+/)
-    .map((v) => v.trim())
-    .filter(Boolean);
-}
-
-function normalizeOrigin(originLike) {
-  const value = originLike?.trim();
-  if (!value) return null;
-  if (value === "*") return value;
-  try {
-    if (value.startsWith("http://") || value.startsWith("https://")) {
-      return new URL(value).origin;
+    } catch (err) {
+      if (
+        err.name !== "AbortError" &&
+        err.code !== "ECONNREFUSED" &&
+        err.cause?.code !== "ECONNREFUSED"
+      ) {
+        const msg = err.code || err.message;
+        if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+          log.warn("gateway", `health check error: ${msg}`);
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
     }
-    return new URL(`https://${value}`).origin;
-  } catch {
-    return null;
-  }
-}
-
-function addOrigin(set, originLike) {
-  const normalized = normalizeOrigin(originLike);
-  if (normalized) set.add(normalized);
-}
-
-function computeControlUiAllowedOrigins(req) {
-  const origins = new Set();
-
-  addOrigin(origins, "http://localhost");
-  addOrigin(origins, "http://127.0.0.1");
-  addOrigin(origins, `http://localhost:${PORT}`);
-  addOrigin(origins, `http://127.0.0.1:${PORT}`);
-
-  for (const railwayValue of [
-    process.env.RAILWAY_PUBLIC_DOMAIN,
-    process.env.RAILWAY_STATIC_URL,
-    process.env.RAILWAY_PUBLIC_URL,
-    process.env.RAILWAY_URL,
-  ]) {
-    addOrigin(origins, railwayValue);
   }
 
-  for (const fromEnv of parseOrigins(CONTROL_UI_ALLOWED_ORIGINS)) {
-    addOrigin(origins, fromEnv);
-  }
-
-  if (req) {
-    const host = String(req.headers["x-forwarded-host"] || req.headers.host || "")
-      .split(",")[0]
-      .trim();
-    const proto = String(req.headers["x-forwarded-proto"] || "")
-      .split(",")[0]
-      .trim() || (req.socket?.encrypted ? "https" : "http");
-    if (host) {
-      addOrigin(origins, `${proto}://${host}`);
-    }
-    addOrigin(origins, String(req.headers.origin || ""));
-  }
-
-  return [...origins];
-}
-
-let allowedOriginsHash = null;
-
-async function ensureControlUiAllowedOrigins(req) {
-  if (!isConfigured()) return { changed: false };
-
-  const origins = computeControlUiAllowedOrigins(req);
-  if (!origins.length) return { changed: false };
-
-  const originsJson = JSON.stringify(origins);
-  const nextHash = crypto.createHash("sha1").update(originsJson).digest("hex");
-  if (nextHash === allowedOriginsHash) {
-    return { changed: false, origins };
-  }
-
-  const result = await runCmd(
-    OPENCLAW_NODE,
-    clawArgs([
-      "config",
-      "set",
-      "--json",
-      "gateway.controlUi.allowedOrigins",
-      originsJson,
-    ]),
-  );
-  allowedOriginsHash = nextHash;
-
-  return {
-    changed: true,
-    origins,
-    result,
-  };
+  return { ok: false, endpoint: null };
 }
 
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
-  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
 
   while (Date.now() - start < timeoutMs) {
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
-          method: "GET",
-        });
-        if (res) {
-          log.info("gateway", `ready at ${endpoint}`);
-          return true;
-        }
-      } catch (err) {
-        if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
-          const msg = err.code || err.message;
-          if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-            log.warn("gateway", `health check error: ${msg}`);
-          }
-        }
-      }
+    const probe = await probeGatewayOnce();
+    if (probe.ok) {
+      log.info("gateway", `ready at ${probe.endpoint}`);
+      return true;
     }
     await sleep(250);
   }
@@ -332,6 +356,8 @@ async function startGateway() {
     "gateway",
     "run",
     "--bind",
+    // Intentional for Railway: only the wrapper is public, and it proxies to the
+    // gateway over loopback while injecting auth.
     "loopback",
     "--port",
     String(INTERNAL_GATEWAY_PORT),
@@ -342,6 +368,7 @@ async function startGateway() {
     "--allow-unconfigured",
   ];
 
+  gatewayLastStartTime = Date.now();
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
@@ -366,16 +393,35 @@ async function startGateway() {
 
   gatewayProc.on("exit", (code, signal) => {
     log.error("gateway", `exited code=${code} signal=${signal}`);
+    const uptime = Date.now() - gatewayLastStartTime;
     gatewayProc = null;
-    if (!shuttingDown && isConfigured()) {
-      log.info("gateway", "scheduling auto-restart in 2s...");
-      setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
-          ensureGatewayRunning().catch((err) => {
-            log.error("gateway", `auto-restart failed: ${err.message}`);
-          });
+    if (!shuttingDown && !intentionalRestart && isConfigured()) {
+      if (uptime > 30_000) {
+        gatewayRestartCount = 0;
+      } else {
+        gatewayRestartCount++;
+      }
+      const delay = Math.min(2000 * Math.pow(2, gatewayRestartCount), 60_000);
+      log.info("gateway", `scheduling auto-restart in ${delay / 1000}s (attempt ${gatewayRestartCount}, uptime ${Math.round(uptime / 1000)}s)...`);
+      setTimeout(async () => {
+        if (shuttingDown || gatewayProc || !isConfigured()) {
+          return;
         }
-      }, 2000);
+
+        const probe = await probeGatewayOnce();
+        if (probe.ok) {
+          log.info(
+            "gateway",
+            `gateway still reachable at ${probe.endpoint}; assuming OpenClaw restarted itself`,
+          );
+          gatewayRestartCount = 0;
+          return;
+        }
+
+        ensureGatewayRunning().catch((err) => {
+          log.error("gateway", `auto-restart failed: ${err.message}`);
+        });
+      }, delay);
     }
   });
 }
@@ -383,6 +429,10 @@ async function startGateway() {
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
+  const probe = await probeGatewayOnce();
+  if (probe.ok) {
+    return { ok: true, reason: "reachable" };
+  }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       await syncAllowedOrigins();
@@ -409,6 +459,7 @@ function isGatewayReady() {
 
 async function restartGateway() {
   if (gatewayProc) {
+    intentionalRestart = true;
     try {
       gatewayProc.kill("SIGTERM");
     } catch (err) {
@@ -416,7 +467,10 @@ async function restartGateway() {
     }
     await sleep(750);
     gatewayProc = null;
+    intentionalRestart = false;
   }
+  await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  gatewayRestartCount = 0;
   return ensureGatewayRunning();
 }
 
@@ -488,36 +542,32 @@ app.get("/styles.css", (_req, res) => {
 });
 
 app.get("/healthz", async (_req, res) => {
-  let gateway = "unconfigured";
-  if (isConfigured()) {
-    gateway = isGatewayReady() ? "ready" : "starting";
-  }
-  res.json({ ok: true, gateway });
+  const configured = isConfigured();
+  const health = describeGatewayHealth({
+    configured,
+    hasProcessHandle: isGatewayReady(),
+    starting: isGatewayStarting(),
+    reachable: configured ? (await probeGatewayOnce()).ok : false,
+  });
+  res.json({ ok: true, gateway: health.gateway });
 });
 
 app.get("/setup/healthz", async (_req, res) => {
   const configured = isConfigured();
-  const gatewayRunning = isGatewayReady();
-  const starting = isGatewayStarting();
-  let gatewayReachable = false;
+  const health = describeGatewayHealth({
+    configured,
+    hasProcessHandle: isGatewayReady(),
+    starting: isGatewayStarting(),
+    reachable: configured ? (await probeGatewayOnce()).ok : false,
+  });
 
-  if (gatewayRunning) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-      const r = await fetch(`${GATEWAY_TARGET}/`, { signal: controller.signal });
-      clearTimeout(timeout);
-      gatewayReachable = r !== null;
-    } catch {}
-  }
-
-  res.json({
+  res.status(health.statusCode).json({
     ok: true,
     wrapper: true,
     configured,
-    gatewayRunning,
-    gatewayStarting: starting,
-    gatewayReachable,
+    gatewayRunning: health.gatewayRunning,
+    gatewayStarting: health.gatewayStarting,
+    gatewayReachable: health.gatewayReachable,
   });
 });
 
@@ -525,18 +575,65 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "setup.html"));
 });
 
+app.get("/setup/config", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "config.html"));
+});
+
+app.get("/setup/api/config/raw", requireSetupAuth, (_req, res) => {
+  const p = configPath();
+  const exists = fs.existsSync(p);
+  const content = exists ? fs.readFileSync(p, "utf8") : "";
+  res.json({ ok: true, path: p, exists, content });
+});
+
+app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
+  const content = String((req.body && req.body.content) || "");
+  if (content.length > 500_000) {
+    return res
+      .status(413)
+      .json({ ok: false, error: "Config too large (max 500KB)" });
+  }
+  try {
+    JSON.parse(content);
+  } catch (err) {
+    return res
+      .status(400)
+      .json({ ok: false, error: `Invalid JSON: ${err.message}` });
+  }
+
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const p = configPath();
+  let backupPath = null;
+  if (fs.existsSync(p)) {
+    backupPath = `${p}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    fs.copyFileSync(p, backupPath);
+  }
+
+  // Write to a sibling tmp file then renameSync over the live config so a
+  // crash or disk-full mid-write can't leave openclaw.json truncated.
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    return res
+      .status(500)
+      .json({ ok: false, error: `Failed to write config: ${err.message}` });
+  }
+
+  let restarted = false;
+  if (isConfigured()) {
+    await restartGateway();
+    restarted = true;
+  }
+  res.json({ ok: true, path: p, backupPath, restarted });
+});
+
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
-  const { version, channelsHelp } = await getOpenclawInfo();
+  const { version } = await getOpenclawInfo();
 
   const authGroups = [
-    {
-      value: "openai",
-      label: "OpenAI",
-      hint: "API key",
-      options: [
-        { value: "openai-api-key", label: "OpenAI API key" },
-      ],
-    },
     {
       value: "anthropic",
       label: "Anthropic",
@@ -546,11 +643,33 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       ],
     },
     {
+      value: "openai",
+      label: "OpenAI",
+      hint: "API key / Codex",
+      options: [
+        { value: "openai-api-key", label: "OpenAI API key" },
+        {
+          value: "openai-codex-device-code",
+          label: "OpenAI Codex device pairing",
+          hint: "ChatGPT login without an API key",
+        },
+      ],
+    },
+    {
       value: "google",
       label: "Google",
-      hint: "API key",
+      hint: "API key / CLI",
       options: [
         { value: "gemini-api-key", label: "Google Gemini API key" },
+        { value: "google-gemini-cli", label: "Google Gemini CLI (OAuth)" },
+      ],
+    },
+    {
+      value: "deepseek",
+      label: "DeepSeek",
+      hint: "API key",
+      options: [
+        { value: "deepseek-api-key", label: "DeepSeek API key" },
       ],
     },
     {
@@ -560,42 +679,28 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       options: [{ value: "openrouter-api-key", label: "OpenRouter API key" }],
     },
     {
-      value: "ai-gateway",
-      label: "Vercel AI Gateway",
+      value: "xai",
+      label: "xAI (Grok)",
       hint: "API key",
-      options: [
-        { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
-      ],
+      options: [{ value: "xai-api-key", label: "xAI API key" }],
     },
     {
-      value: "moonshot",
-      label: "Moonshot AI",
-      hint: "Kimi K2 + Kimi Code",
-      options: [
-        { value: "moonshot-api-key", label: "Moonshot AI API key" },
-        { value: "kimi-code-api-key", label: "Kimi Code API key" },
-      ],
-    },
-    {
-      value: "zai",
-      label: "Z.AI (GLM 4.7)",
+      value: "mistral",
+      label: "Mistral AI",
       hint: "API key",
-      options: [{ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" }],
+      options: [{ value: "mistral-api-key", label: "Mistral API key" }],
     },
     {
-      value: "minimax",
-      label: "MiniMax",
-      hint: "M2.1 (recommended)",
-      options: [
-        { value: "minimax-api", label: "MiniMax M2.1" },
-        { value: "minimax-api-lightning", label: "MiniMax M2.1 Lightning" },
-      ],
+      value: "together",
+      label: "Together AI",
+      hint: "API key",
+      options: [{ value: "together-api-key", label: "Together AI API key" }],
     },
     {
-      value: "qwen",
-      label: "Qwen",
-      hint: "OAuth",
-      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
+      value: "huggingface",
+      label: "Hugging Face",
+      hint: "API key",
+      options: [{ value: "huggingface-api-key", label: "Hugging Face API key" }],
     },
     {
       value: "copilot",
@@ -610,18 +715,152 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       ],
     },
     {
+      value: "moonshot",
+      label: "Moonshot AI",
+      hint: "Kimi K2 + Kimi Code",
+      options: [
+        { value: "moonshot-api-key", label: "Moonshot AI API key" },
+        { value: "moonshot-api-key-cn", label: "Moonshot AI API key (CN)" },
+        { value: "kimi-code-api-key", label: "Kimi Code API key" },
+      ],
+    },
+    {
+      value: "minimax",
+      label: "MiniMax",
+      hint: "API key / OAuth",
+      options: [
+        { value: "minimax-global-api", label: "MiniMax API key (Global)" },
+        { value: "minimax-global-oauth", label: "MiniMax OAuth (Global)" },
+        { value: "minimax-cn-api", label: "MiniMax API key (CN)" },
+        { value: "minimax-cn-oauth", label: "MiniMax OAuth (CN)" },
+      ],
+    },
+    {
+      value: "zai",
+      label: "Z.AI (GLM 4.7)",
+      hint: "API key / OAuth",
+      options: [
+        { value: "zai-api-key", label: "Z.AI API key" },
+        { value: "zai-coding-global", label: "Z.AI Coding (Global)" },
+        { value: "zai-coding-cn", label: "Z.AI Coding (CN)" },
+        { value: "zai-global", label: "Z.AI (Global)" },
+        { value: "zai-cn", label: "Z.AI (CN)" },
+      ],
+    },
+    {
+      value: "qwen",
+      label: "Qwen",
+      hint: "OAuth",
+      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
+    },
+    {
+      value: "modelstudio",
+      label: "Alibaba Model Studio",
+      hint: "Qwen via Alibaba Cloud",
+      options: [
+        { value: "modelstudio-api-key", label: "Coding Plan (Global)" },
+        { value: "modelstudio-api-key-cn", label: "Coding Plan (CN)" },
+        { value: "modelstudio-standard-api-key", label: "Standard Plan (Global)" },
+        { value: "modelstudio-standard-api-key-cn", label: "Standard Plan (CN)" },
+      ],
+    },
+    {
+      value: "venice",
+      label: "Venice AI",
+      hint: "API key",
+      options: [{ value: "venice-api-key", label: "Venice AI API key" }],
+    },
+    {
+      value: "chutes",
+      label: "Chutes",
+      hint: "OAuth / API key",
+      options: [
+        { value: "chutes", label: "Chutes OAuth" },
+        { value: "chutes-api-key", label: "Chutes API key" },
+      ],
+    },
+    {
+      value: "kilocode",
+      label: "Kilocode",
+      hint: "API key",
+      options: [{ value: "kilocode-api-key", label: "Kilocode API key" }],
+    },
+    {
+      value: "xiaomi",
+      label: "Xiaomi",
+      hint: "API key",
+      options: [{ value: "xiaomi-api-key", label: "Xiaomi API key" }],
+    },
+    {
+      value: "volcengine",
+      label: "Volcano Engine (Doubao)",
+      hint: "API key",
+      options: [{ value: "volcengine-api-key", label: "Volcano Engine API key" }],
+    },
+    {
+      value: "byteplus",
+      label: "BytePlus",
+      hint: "API key",
+      options: [{ value: "byteplus-api-key", label: "BytePlus API key" }],
+    },
+    {
+      value: "qianfan",
+      label: "Qianfan (Baidu)",
+      hint: "API key",
+      options: [{ value: "qianfan-api-key", label: "Qianfan API key" }],
+    },
+    {
+      value: "ai-gateway",
+      label: "Vercel AI Gateway",
+      hint: "API key",
+      options: [
+        { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
+      ],
+    },
+    {
+      value: "cloudflare-ai-gateway",
+      label: "Cloudflare AI Gateway",
+      hint: "API key",
+      options: [
+        { value: "cloudflare-ai-gateway-api-key", label: "Cloudflare AI Gateway API key" },
+      ],
+    },
+    {
+      value: "litellm",
+      label: "LiteLLM",
+      hint: "Unified gateway",
+      options: [{ value: "litellm-api-key", label: "LiteLLM API key" }],
+    },
+    {
+      value: "opencode",
+      label: "OpenCode",
+      hint: "Zen / Go",
+      options: [
+        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+        { value: "opencode-go", label: "OpenCode Go" },
+      ],
+    },
+    {
       value: "synthetic",
       label: "Synthetic",
       hint: "Anthropic-compatible (multi-model)",
       options: [{ value: "synthetic-api-key", label: "Synthetic API key" }],
     },
     {
-      value: "opencode-zen",
-      label: "OpenCode Zen",
-      hint: "API key",
+      value: "self-hosted",
+      label: "Self-hosted",
+      hint: "Ollama / vLLM / SGLang",
       options: [
-        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+        { value: "ollama", label: "Ollama (local)" },
+        { value: "vllm", label: "vLLM" },
+        { value: "sglang", label: "SGLang" },
       ],
+    },
+    {
+      value: "custom",
+      label: "Custom endpoint",
+      hint: "OpenAI / Anthropic compatible",
+      options: [{ value: "custom-api-key", label: "Custom provider" }],
     },
   ];
 
@@ -629,18 +868,20 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     configured: isConfigured(),
     gatewayTarget: GATEWAY_TARGET,
     openclawVersion: version,
-    channelsAddHelp: channelsHelp,
     authGroups,
     tuiEnabled: ENABLE_WEB_TUI,
   });
 });
 
+function requiresInteractiveOnboarding(payload) {
+  return payload.authChoice === "openai-codex-device-code";
+}
+
 function buildOnboardArgs(payload) {
+  const interactive = requiresInteractiveOnboarding(payload);
   const args = [
     "onboard",
-    "--non-interactive",
     "--accept-risk",
-    "--json",
     "--no-install-daemon",
     "--skip-health",
     "--workspace",
@@ -657,27 +898,77 @@ function buildOnboardArgs(payload) {
     "quickstart",
   ];
 
+  if (interactive) {
+    args.push(
+      "--mode",
+      "local",
+      "--skip-channels",
+      "--skip-skills",
+      "--skip-search",
+      "--skip-ui",
+    );
+  } else {
+    args.push("--non-interactive", "--json");
+  }
+
   if (payload.authChoice) {
     args.push("--auth-choice", payload.authChoice);
 
     const secret = (payload.authSecret || "").trim();
     const map = {
-      "openai-api-key": "--openai-api-key",
       apiKey: "--anthropic-api-key",
-      "openrouter-api-key": "--openrouter-api-key",
-      "ai-gateway-api-key": "--ai-gateway-api-key",
-      "moonshot-api-key": "--moonshot-api-key",
-      "kimi-code-api-key": "--kimi-code-api-key",
+      "openai-api-key": "--openai-api-key",
       "gemini-api-key": "--gemini-api-key",
+      "deepseek-api-key": "--deepseek-api-key",
+      "openrouter-api-key": "--openrouter-api-key",
+      "xai-api-key": "--xai-api-key",
+      "mistral-api-key": "--mistral-api-key",
+      "together-api-key": "--together-api-key",
+      "huggingface-api-key": "--huggingface-api-key",
+      "moonshot-api-key": "--moonshot-api-key",
+      "moonshot-api-key-cn": "--moonshot-api-key",
+      "kimi-code-api-key": "--kimi-code-api-key",
+      "minimax-global-api": "--minimax-api-key",
+      "minimax-cn-api": "--minimax-api-key",
       "zai-api-key": "--zai-api-key",
-      "minimax-api": "--minimax-api-key",
-      "minimax-api-lightning": "--minimax-api-key",
-      "synthetic-api-key": "--synthetic-api-key",
+      "modelstudio-api-key": "--modelstudio-api-key",
+      "modelstudio-api-key-cn": "--modelstudio-api-key-cn",
+      "modelstudio-standard-api-key": "--modelstudio-standard-api-key",
+      "modelstudio-standard-api-key-cn": "--modelstudio-standard-api-key-cn",
+      "venice-api-key": "--venice-api-key",
+      "chutes-api-key": "--chutes-api-key",
+      "kilocode-api-key": "--kilocode-api-key",
+      "xiaomi-api-key": "--xiaomi-api-key",
+      "volcengine-api-key": "--volcengine-api-key",
+      "byteplus-api-key": "--byteplus-api-key",
+      "qianfan-api-key": "--qianfan-api-key",
+      "ai-gateway-api-key": "--ai-gateway-api-key",
+      "cloudflare-ai-gateway-api-key": "--cloudflare-ai-gateway-api-key",
+      "litellm-api-key": "--litellm-api-key",
       "opencode-zen": "--opencode-zen-api-key",
+      "opencode-go": "--opencode-go-api-key",
+      "synthetic-api-key": "--synthetic-api-key",
+      "custom-api-key": "--custom-api-key",
     };
     const flag = map[payload.authChoice];
     if (flag && secret) {
       args.push(flag, secret);
+    }
+
+    if (payload.authChoice === "custom-api-key") {
+      const baseUrl = (payload.customBaseUrl || "").trim();
+      const modelId = (payload.customModelId || "").trim();
+      const compat = (payload.customCompatibility || "").trim();
+      if (baseUrl) args.push("--custom-base-url", baseUrl);
+      if (modelId) args.push("--custom-model-id", modelId);
+      if (compat) args.push("--custom-compatibility", compat);
+    }
+
+    if (payload.authChoice === "cloudflare-ai-gateway-api-key") {
+      const accountId = (payload.cloudflareAccountId || "").trim();
+      const gatewayId = (payload.cloudflareGatewayId || "").trim();
+      if (accountId) args.push("--cloudflare-ai-gateway-account-id", accountId);
+      if (gatewayId) args.push("--cloudflare-ai-gateway-gateway-id", gatewayId);
     }
 
   }
@@ -687,8 +978,9 @@ function buildOnboardArgs(payload) {
 
 function runCmd(cmd, args, opts = {}) {
   return new Promise((resolve) => {
+    const { autoInputs: _autoInputs, onOutput, stripOutput, ...spawnOpts } = opts;
     const proc = childProcess.spawn(cmd, args, {
-      ...opts,
+      ...spawnOpts,
       env: {
         ...process.env,
         OPENCLAW_STATE_DIR: STATE_DIR,
@@ -697,8 +989,14 @@ function runCmd(cmd, args, opts = {}) {
     });
 
     let out = "";
-    proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
-    proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
+    const append = (d) => {
+      const rawChunk = d.toString("utf8");
+      const streamChunk = stripOutput ? stripAnsi(rawChunk) : rawChunk;
+      out += rawChunk;
+      onOutput?.(streamChunk);
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
 
     proc.on("error", (err) => {
       out += `\n[spawn error] ${String(err)}\n`;
@@ -709,27 +1007,117 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+function runPtyCmd(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let out = "";
+    const autoInputs = opts.autoInputs ?? [];
+    const sentAutoInputs = new Set();
+    let proc;
+    try {
+      proc = pty.spawn(cmd, args, {
+        name: "xterm-color",
+        cols: 100,
+        rows: 30,
+        cwd: opts.cwd ?? process.cwd(),
+        env: {
+          ...process.env,
+          OPENCLAW_STATE_DIR: STATE_DIR,
+          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+          // Force OpenClaw's local device-code branch so Railway setup can show
+          // the short code in the web UI instead of hiding it as remote-only.
+          DISPLAY: process.env.DISPLAY || ":0",
+          WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || "wayland-0",
+          SSH_CLIENT: "",
+          SSH_TTY: "",
+          SSH_CONNECTION: "",
+          FORCE_COLOR: "0",
+          NO_COLOR: "1",
+        },
+      });
+    } catch (err) {
+      out += `\n[spawn error] ${String(err)}\n`;
+      opts.onOutput?.(out);
+      resolve({ code: 127, output: out });
+      return;
+    }
+
+    proc.onData((data) => {
+      const chunk = opts.cleanOutput ? cleanPtyOutput(data) : stripAnsi(data);
+      if (!chunk) return;
+      out += chunk;
+      for (const { input, pattern } of autoInputs) {
+        const key = String(pattern);
+        if (sentAutoInputs.has(key) || !pattern.test(out)) continue;
+        sentAutoInputs.add(key);
+        proc.write(input);
+      }
+      opts.onOutput?.(chunk);
+    });
+
+    proc.onExit(({ exitCode }) => {
+      resolve({ code: exitCode ?? 0, output: out });
+    });
+  });
+}
+
 const VALID_AUTH_CHOICES = [
-  "openai-api-key",
   "apiKey",
+  "openai-api-key",
+  "openai-codex",
+  "openai-codex-device-code",
   "gemini-api-key",
+  "google-gemini-cli",
+  "deepseek-api-key",
   "openrouter-api-key",
-  "ai-gateway-api-key",
-  "moonshot-api-key",
-  "kimi-code-api-key",
-  "zai-api-key",
-  "minimax-api",
-  "minimax-api-lightning",
-  "qwen-portal",
+  "xai-api-key",
+  "mistral-api-key",
+  "together-api-key",
+  "huggingface-api-key",
   "github-copilot",
   "copilot-proxy",
-  "synthetic-api-key",
+  "moonshot-api-key",
+  "moonshot-api-key-cn",
+  "kimi-code-api-key",
+  "minimax-global-api",
+  "minimax-global-oauth",
+  "minimax-cn-api",
+  "minimax-cn-oauth",
+  "zai-api-key",
+  "zai-coding-global",
+  "zai-coding-cn",
+  "zai-global",
+  "zai-cn",
+  "qwen-portal",
+  "modelstudio-api-key",
+  "modelstudio-api-key-cn",
+  "modelstudio-standard-api-key",
+  "modelstudio-standard-api-key-cn",
+  "venice-api-key",
+  "chutes",
+  "chutes-api-key",
+  "kilocode-api-key",
+  "xiaomi-api-key",
+  "volcengine-api-key",
+  "byteplus-api-key",
+  "qianfan-api-key",
+  "ai-gateway-api-key",
+  "cloudflare-ai-gateway-api-key",
+  "litellm-api-key",
   "opencode-zen",
+  "opencode-go",
+  "synthetic-api-key",
+  "ollama",
+  "vllm",
+  "sglang",
+  "custom-api-key",
 ];
 
 function validatePayload(payload) {
-if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
+  if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     return `Invalid authChoice: ${payload.authChoice}`;
+  }
+  if (payload.authChoice === "openai-codex") {
+    return "OpenAI Codex browser login needs redirect-url input in an interactive terminal. Choose OpenAI Codex device pairing in web setup.";
   }
   const stringFields = [
     "telegramToken",
@@ -738,6 +1126,11 @@ if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     "slackAppToken",
     "authSecret",
     "model",
+    "customBaseUrl",
+    "customModelId",
+    "customCompatibility",
+    "cloudflareAccountId",
+    "cloudflareGatewayId",
   ];
   for (const field of stringFields) {
     if (payload[field] !== undefined && typeof payload[field] !== "string") {
@@ -748,14 +1141,16 @@ if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
 }
 
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+  const stream = (chunk) => {
+    if (chunk) res.write(chunk);
+  };
+
   try {
     if (isConfigured()) {
       await ensureGatewayRunning();
-      return res.json({
-        ok: true,
-        output:
-          "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
-      });
+      return res
+        .type("text/plain")
+        .send("Already configured.\nUse Reset setup if you want to rerun onboarding.\n");
     }
 
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -764,18 +1159,35 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     const payload = req.body || {};
     const validationError = validatePayload(payload);
     if (validationError) {
-      return res.status(400).json({ ok: false, output: validationError });
+      return res.status(400).type("text/plain").send(`${validationError}\n`);
     }
-    const onboardArgs = buildOnboardArgs(payload);
-    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
 
-    let extra = "";
-    extra += `\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`;
+    res.set({
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+
+    const onboardArgs = buildOnboardArgs(payload);
+    const interactive = requiresInteractiveOnboarding(payload);
+    stream(
+      interactive
+        ? "Starting OpenAI Codex device pairing. Use the URL and code below, then keep this page open until it completes.\n\n"
+        : "Starting OpenClaw onboarding...\n\n",
+    );
+
+    const onboardRunner = interactive ? runPtyCmd : runCmd;
+    const onboard = await onboardRunner(OPENCLAW_NODE, clawArgs(onboardArgs), {
+      onOutput: stream,
+      cleanOutput: interactive,
+      stripOutput: !interactive,
+      autoInputs: interactive ? [{ pattern: /Enable hooks\?/, input: " \r" }] : [],
+    });
 
     const ok = onboard.code === 0 && isConfigured();
+    stream(`\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`);
 
     if (ok) {
-      extra += "\n[setup] Configuring gateway settings...\n";
+      stream("\n[setup] Configuring gateway settings...\n");
 
       const allowInsecureResult = await runCmd(
         OPENCLAW_NODE,
@@ -786,7 +1198,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           "true",
         ]),
       );
-      extra += `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`;
+      stream(
+        `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`,
+      );
 
       const tokenResult = await runCmd(
         OPENCLAW_NODE,
@@ -797,7 +1211,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           OPENCLAW_GATEWAY_TOKEN,
         ]),
       );
-      extra += `[config] gateway.auth.token exit=${tokenResult.code}\n`;
+      stream(`[config] gateway.auth.token exit=${tokenResult.code}\n`);
 
       const proxiesResult = await runCmd(
         OPENCLAW_NODE,
@@ -809,20 +1223,16 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           '["127.0.0.1"]',
         ]),
       );
-      extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
-
-      const allowedOriginsResult = await ensureControlUiAllowedOrigins();
-      if (allowedOriginsResult.changed) {
-        extra += `[config] gateway.controlUi.allowedOrigins exit=${allowedOriginsResult.result.code} count=${allowedOriginsResult.origins.length}\n`;
-      }
+      stream(`[config] gateway.trustedProxies exit=${proxiesResult.code}\n`);
 
       if (payload.model?.trim()) {
-        extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
+        stream(`[setup] Setting model to ${payload.model.trim()}...\n`);
         const modelResult = await runCmd(
           OPENCLAW_NODE,
           clawArgs(["models", "set", payload.model.trim()]),
+          { onOutput: stream, stripOutput: true },
         );
-        extra += `[models set] exit=${modelResult.code}\n${modelResult.output || ""}`;
+        stream(`[models set] exit=${modelResult.code}\n`);
       }
 
       async function configureChannel(name, cfgObj) {
@@ -840,24 +1250,24 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           OPENCLAW_NODE,
           clawArgs(["config", "get", `channels.${name}`]),
         );
-        return (
+        stream(
           `\n[${name} config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}` +
-          `\n[${name} verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`
+            `\n[${name} verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}\n`,
         );
       }
 
       if (payload.telegramToken?.trim()) {
-        extra += await configureChannel("telegram", {
+        await configureChannel("telegram", {
           enabled: true,
           dmPolicy: "pairing",
           botToken: payload.telegramToken.trim(),
           groupPolicy: "open",
-          streamMode: "partial",
+          streaming: { mode: "partial" },
         });
       }
 
       if (payload.discordToken?.trim()) {
-        extra += await configureChannel("discord", {
+        await configureChannel("discord", {
           enabled: true,
           token: payload.discordToken.trim(),
           groupPolicy: "open",
@@ -866,27 +1276,27 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       }
 
       if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
-        extra += await configureChannel("slack", {
+        await configureChannel("slack", {
           enabled: true,
           botToken: payload.slackBotToken?.trim() || undefined,
           appToken: payload.slackAppToken?.trim() || undefined,
         });
       }
 
-      extra += "\n[setup] Starting gateway...\n";
+      stream("\n[setup] Starting gateway...\n");
       await restartGateway();
-      extra += "[setup] Gateway started.\n";
+      stream("[setup] Gateway started.\n");
     }
 
-    return res.status(ok ? 200 : 500).json({
-      ok,
-      output: `${onboard.output}${extra}`,
-    });
+    stream(ok ? "\n[setup] Complete.\n" : "\n[setup] Failed. Review the output above.\n");
+    return res.end();
   } catch (err) {
     log.error("setup", `run error: ${String(err)}`);
-    return res
-      .status(500)
-      .json({ ok: false, output: `Internal error: ${String(err)}` });
+    if (!res.headersSent) {
+      return res.status(500).type("text/plain").send(`Internal error: ${String(err)}\n`);
+    }
+    stream(`\n[setup] Internal error: ${String(err)}\n`);
+    return res.end();
   }
 });
 
@@ -920,26 +1330,74 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
 
 app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   const { channel, code } = req.body || {};
-  if (!channel || !code) {
+  const channelValue = String(channel || "").trim().toLowerCase();
+  const codeValue = String(code || "").trim();
+  if (!channelValue || !codeValue) {
     return res
       .status(400)
-      .json({ ok: false, error: "Missing channel or code" });
+      .json({
+        ok: false,
+        code: "invalid_request",
+        message: "Choose a channel and enter a pairing code.",
+        error: "Missing channel or code",
+      });
+  }
+  if (!["telegram", "discord"].includes(channelValue)) {
+    return res.status(400).json({
+      ok: false,
+      code: "invalid_channel",
+      message: "Channel must be Telegram or Discord.",
+      error: `Invalid channel: ${channelValue}`,
+    });
   }
   const r = await runCmd(
     OPENCLAW_NODE,
-    clawArgs(["pairing", "approve", String(channel), String(code)]),
+    clawArgs(["pairing", "approve", channelValue, codeValue]),
   );
-  return res
-    .status(r.code === 0 ? 200 : 500)
-    .json({ ok: r.code === 0, output: r.output });
+  const output = r.output || "";
+  const cleanOutput = stripAnsi(output);
+
+  if (r.code === 0) {
+    return res.status(200).json({
+      ok: true,
+      code: "approved",
+      message: "Channel access approved.",
+      output,
+    });
+  }
+
+  if (/no pending pairing request/i.test(cleanOutput)) {
+    return res.status(404).json({
+      ok: false,
+      code: "no_pending_request",
+      message:
+        "No pending request matched that code. It may already be approved, expired, or replaced by a newer code.",
+      output,
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    code: "pairing_failed",
+    message: "Channel approval failed. Review the log output for details.",
+    output,
+  });
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   try {
+    if (gatewayProc) {
+      intentionalRestart = true;
+      gatewayProc.kill("SIGTERM");
+      await sleep(750);
+      gatewayProc = null;
+      intentionalRestart = false;
+    }
+    await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
     fs.rmSync(configPath(), { force: true });
     res
       .type("text/plain")
-      .send("OK - deleted config file. You can rerun setup now.");
+      .send("OK - stopped gateway and deleted config file. You can rerun setup now.");
   } catch (err) {
     res.status(500).type("text/plain").send(String(err));
   }
@@ -955,29 +1413,84 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
 });
 
 app.get("/setup/api/devices", requireSetupAuth, async (_req, res) => {
-  const args = ["devices", "list", "--json", "--token", OPENCLAW_GATEWAY_TOKEN];
-  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
   try {
-    const data = JSON.parse(result.output);
-    return res.json({ ok: true, data, raw: result.output });
-  } catch {
-    return res.json({ ok: result.code === 0, raw: result.output });
+    const { listDevicePairing } = await loadDeviceBootstrapSdk();
+    const data = await listDevicePairing();
+    log.info(
+      "devices",
+      `local list pending=${data?.pending?.length ?? 0} paired=${data?.paired?.length ?? 0}`,
+    );
+    return res.json({ ok: true, data });
+  } catch (err) {
+    const message = err?.message || String(err);
+    log.warn("devices", `local list failed: ${message}`);
+    return res.status(500).json({ ok: false, error: message });
   }
 });
 
 app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
-  const { requestId } = req.body || {};
-  const args = ["devices", "approve"];
-  if (requestId) {
-    args.push(String(requestId));
-  } else {
-    args.push("--latest");
+  const requestId = String(req.body?.requestId || "").trim();
+
+  try {
+    const { approveDevicePairing, listDevicePairing } =
+      await loadDeviceBootstrapSdk();
+    const pairings = await listDevicePairing();
+    const pending = Array.isArray(pairings?.pending) ? pairings.pending : [];
+
+    let targetRequestId = requestId;
+    if (targetRequestId) {
+      const exists = pending.some(
+        (request) => request?.requestId === targetRequestId,
+      );
+      if (!exists) {
+        return res.status(404).json({
+          ok: false,
+          error: `Unknown pending device pairing request: ${targetRequestId}`,
+        });
+      }
+    } else {
+      const latest = newestPendingDevicePairing(pending);
+      targetRequestId = latest?.requestId || "";
+      if (!targetRequestId) {
+        return res.status(404).json({
+          ok: false,
+          error: "No pending device pairing requests.",
+        });
+      }
+    }
+
+    const result = await approveDevicePairing(targetRequestId, {
+      // /setup is guarded by SETUP_PASSWORD and runs in the same state volume
+      // as the gateway, so it acts as the trusted bootstrap admin surface.
+      callerScopes: ["operator.admin"],
+    });
+
+    if (!result) {
+      return res.status(404).json({
+        ok: false,
+        error: `Unknown pending device pairing request: ${targetRequestId}`,
+      });
+    }
+
+    if (result.status === "forbidden") {
+      return res.status(403).json({
+        ok: false,
+        error: describeDeviceApprovalForbidden(result),
+        reason: result.reason,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      requestId: targetRequestId,
+      device: result.device,
+      output: `Approved device pairing request ${targetRequestId}.`,
+    });
+  } catch (err) {
+    const message = err?.message || String(err);
+    log.error("devices", `local approve failed: ${message}`);
+    return res.status(500).json({ ok: false, error: message });
   }
-  args.push("--token", OPENCLAW_GATEWAY_TOKEN);
-  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
-  return res
-    .status(result.code === 0 ? 200 : 500)
-    .json({ ok: result.code === 0, output: result.output });
 });
 
 app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
@@ -985,6 +1498,8 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
   if (!requestId) {
     return res.status(400).json({ ok: false, error: "Missing requestId" });
   }
+  // TODO: switch this to the bootstrap SDK once rejectDevicePairing is exported
+  // from openclaw/plugin-sdk/device-bootstrap.
   const args = [
     "devices", "reject", String(requestId),
     "--token", OPENCLAW_GATEWAY_TOKEN,
@@ -1041,6 +1556,218 @@ app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
     return res.status(500).json({ ok: false, error: `Export failed: ${err.message}` });
   }
 });
+
+app.post(
+  "/setup/api/import",
+  requireSetupAuth,
+  express.raw({ type: "application/zip", limit: "250mb" }),
+  async (req, res) => {
+    const dataRoot = "/data";
+    const isUnder = (p) => {
+      const abs = path.resolve(p);
+      return abs === dataRoot || abs.startsWith(dataRoot + path.sep);
+    };
+
+    if (!isUnder(STATE_DIR) || !isUnder(WORKSPACE_DIR)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Import only supported when state/workspace dirs are under /data.",
+      });
+    }
+
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || buf.length === 0) {
+      return res.status(400).json({ ok: false, error: "Empty or invalid request body." });
+    }
+
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const tmpZip = path.join(dataRoot, `.import-${ts}.zip`);
+    const tmpExtract = path.join(dataRoot, `.import-extract-${ts}`);
+    const stateAbs = path.resolve(STATE_DIR);
+    const workspaceAbs = path.resolve(WORKSPACE_DIR);
+    // Archive entries are stored relative — `zip` strips the leading "/" from
+    // absolute paths it was given, so /data/.openclaw becomes data/.openclaw.
+    const stateRel = stateAbs.replace(/^\//, "");
+    const workspaceRel = workspaceAbs.replace(/^\//, "");
+    const allowedPrefixes = [stateRel, workspaceRel];
+    const cleanup = () => {
+      try { fs.rmSync(tmpZip, { force: true }); } catch {}
+      try { fs.rmSync(tmpExtract, { recursive: true, force: true }); } catch {}
+    };
+
+    let archivePassword = SETUP_PASSWORD;
+    const headerPw = req.get("x-archive-password");
+    if (headerPw) {
+      try {
+        const decoded = Buffer.from(headerPw, "base64").toString("utf8").trim();
+        if (decoded) archivePassword = decoded;
+      } catch {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid X-Archive-Password header.",
+        });
+      }
+    }
+
+    const reject = (status, error, extra = {}) => {
+      const e = new Error(error);
+      e.status = status;
+      e.extra = extra;
+      return e;
+    };
+    const walkRejectSymlinks = (dir) => {
+      const st = fs.lstatSync(dir);
+      if (st.isSymbolicLink()) {
+        const rel = path.relative(tmpExtract, dir) || path.basename(dir);
+        throw reject(400, `Refusing symlink in archive: ${rel}`);
+      }
+      if (st.isDirectory()) {
+        for (const name of fs.readdirSync(dir)) {
+          walkRejectSymlinks(path.join(dir, name));
+        }
+        return;
+      }
+      if (!st.isFile()) {
+        const rel = path.relative(tmpExtract, dir) || path.basename(dir);
+        throw reject(400, `Refusing non-regular entry in archive: ${rel}`);
+      }
+    };
+
+    const backups = [];
+    let gatewayWasStopped = false;
+    try {
+      fs.writeFileSync(tmpZip, buf);
+
+      // Pre-validate every archive entry. Reject anything that isn't under one
+      // of the configured state/workspace prefixes — the archive is gated by
+      // SETUP_PASSWORD but we never want a malformed or hand-crafted backup to
+      // write outside /data.
+      // -Z (ZipInfo) doesn't accept -P; entry names aren't encrypted so we
+      // don't need the password just to list them.
+      const list = await runCmd("unzip", ["-Z1", tmpZip]);
+      if (list.code !== 0) {
+        throw reject(
+          400,
+          "Failed to read archive. Check the file and that SETUP_PASSWORD matches.",
+          { output: list.output },
+        );
+      }
+      const entries = list.output.split("\n").map((s) => s.trim()).filter(Boolean);
+      const entryAllowed = (e) => {
+        if (e.startsWith("/") || /^[A-Za-z]:[\\/]/.test(e)) return false;
+        const norm = e.replace(/\\/g, "/").replace(/\/+$/, "");
+        if (norm.split("/").includes("..")) return false;
+        return allowedPrefixes.some((p) => norm === p || norm.startsWith(p + "/"));
+      };
+      const bad = entries.filter((e) => !entryAllowed(e));
+      if (bad.length) {
+        throw reject(
+          400,
+          `Archive contains ${bad.length} entries outside ${STATE_DIR} / ${WORKSPACE_DIR}. ` +
+            `First few: ${bad.slice(0, 3).join(", ")}`,
+        );
+      }
+
+      // Extract into a sibling directory under /data so renames into
+      // STATE_DIR / WORKSPACE_DIR are intra-volume (atomic on POSIX).
+      // We extract BEFORE stopping the gateway so a wrong password or
+      // corrupt archive doesn't cost the user any gateway downtime.
+      fs.mkdirSync(tmpExtract, { recursive: true });
+      const extractResult = await runCmd("unzip", ["-P", archivePassword, "-o", tmpZip, "-d", tmpExtract]);
+      if (extractResult.code !== 0) {
+        log.error("import", `unzip exit ${extractResult.code}: ${extractResult.output}`);
+        // unzip exit 82 = wrong password; 81 = needs password but none given.
+        if (extractResult.code === 82 || extractResult.code === 81) {
+          throw reject(
+            400,
+            headerPw
+              ? "Incorrect archive password."
+              : "Incorrect archive password. If this backup was exported from another instance, supply that instance's SETUP_PASSWORD.",
+          );
+        }
+        throw reject(500, "Failed to extract archive.", { output: extractResult.output });
+      }
+
+      // unzip can restore symlinks (zip -y) and other non-regular entries that
+      // would let a crafted archive smuggle e.g. data/.openclaw → /etc. Walk
+      // the extracted tree with lstat and reject anything that isn't a plain
+      // dir or file before we move it into place.
+      walkRejectSymlinks(tmpExtract);
+
+      // Replace each target dir wholesale: rename target → backup, then move
+      // extracted dir into place. Skips dirs absent from the backup so a
+      // partial archive doesn't wipe an unrelated dir.
+      const replacements = [
+        { target: stateAbs, source: path.join(tmpExtract, stateRel) },
+        { target: workspaceAbs, source: path.join(tmpExtract, workspaceRel) },
+      ];
+
+      // Even after walkRejectSymlinks, the entry at the source path itself
+      // could be a regular file masquerading as data/.openclaw. Require an
+      // actual directory before swapping it in for STATE_DIR / WORKSPACE_DIR.
+      // Run this validation BEFORE stopping the gateway so a malformed
+      // archive doesn't cost any downtime.
+      const validReplacements = [];
+      for (const r of replacements) {
+        if (!fs.existsSync(r.source)) continue;
+        if (!fs.lstatSync(r.source).isDirectory()) {
+          throw reject(
+            400,
+            `Archive entry ${path.relative(tmpExtract, r.source)} is not a directory.`,
+          );
+        }
+        validReplacements.push(r);
+      }
+
+      // Now that the archive is fully extracted and validated, take down the
+      // gateway. From here through the rename swap, downtime is unavoidable.
+      if (gatewayProc) {
+        intentionalRestart = true;
+        try {
+          gatewayProc.kill("SIGTERM");
+        } catch (err) {
+          log.warn("import", `kill error: ${err.message}`);
+        }
+        await sleep(750);
+        gatewayProc = null;
+        intentionalRestart = false;
+        gatewayWasStopped = true;
+      }
+
+      for (const { target, source } of validReplacements) {
+        const backup = `${target}.bak-${ts}`;
+        if (fs.existsSync(target)) {
+          fs.renameSync(target, backup);
+          backups.push({ target, backup });
+        }
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.renameSync(source, target);
+      }
+
+      for (const { backup } of backups) {
+        try { fs.rmSync(backup, { recursive: true, force: true }); } catch {}
+      }
+      backups.length = 0;
+
+      log.info("import", `restored ${buf.length} bytes from archive`);
+      await restartGateway();
+      return res.json({ ok: true, output: extractResult.output });
+    } catch (err) {
+      const status = err.status ?? 500;
+      const extra = err.extra ?? {};
+      if (status >= 500) log.error("import", `error: ${err.message}`);
+      // Roll back any partial replacement.
+      for (const { target, backup } of backups) {
+        try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
+        try { fs.renameSync(backup, target); } catch {}
+      }
+      if (gatewayWasStopped) await ensureGatewayRunning().catch(() => {});
+      return res.status(status).json({ ok: false, error: err.message, ...extra });
+    } finally {
+      cleanup();
+    }
+  },
+);
 
 app.get("/logs", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));
@@ -1249,7 +1976,9 @@ const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   : GATEWAY_TARGET;
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
-  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  if (!req.url?.startsWith("/hooks/")) {
+    proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
 });
 
@@ -1259,27 +1988,32 @@ proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
 });
 
 app.use(async (req, res) => {
+  if (req.path === "/") {
+    return res.sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
+  }
+
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
   }
 
   if (isConfigured()) {
-    const originUpdate = await ensureControlUiAllowedOrigins(req);
-    if (originUpdate.changed && isGatewayReady()) {
-      console.log("[gateway] updated gateway.controlUi.allowedOrigins; restarting gateway");
-      await restartGateway();
-    }
-
     if (!isGatewayReady()) {
+      let gatewayReachable = false;
       try {
         await ensureGatewayRunning();
+        gatewayReachable = (await probeGatewayOnce()).ok;
       } catch {
         return res
           .status(503)
           .sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
       }
 
-      if (!isGatewayReady()) {
+      if (
+        !canServeGatewayRequest({
+          configured: true,
+          reachable: gatewayReachable,
+        })
+      ) {
         return res
           .status(503)
           .sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
@@ -1299,6 +2033,7 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
   log.info("wrapper", `configured: ${isConfigured()}`);
+  void probeDeviceBootstrapSdk();
 
   if (isConfigured()) {
     (async () => {
@@ -1309,12 +2044,6 @@ const server = app.listen(PORT, () => {
         if (dr.output) log.info("wrapper", dr.output);
       } catch (err) {
         log.warn("wrapper", `doctor --fix failed: ${err.message}`);
-      }
-      const originUpdate = await ensureControlUiAllowedOrigins();
-      if (originUpdate.changed) {
-        console.log(
-          `[wrapper] configured gateway.controlUi.allowedOrigins (${originUpdate.origins.length} origins)`,
-        );
       }
       await ensureGatewayRunning();
     })().catch((err) => {
@@ -1398,6 +2127,13 @@ async function gracefulShutdown(signal) {
     } catch (err) {
       log.warn("wrapper", `error killing gateway: ${err.message}`);
     }
+  }
+
+  try {
+    const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+    log.info("wrapper", `gateway stop during shutdown exit=${stopResult.code}`);
+  } catch (err) {
+    log.warn("wrapper", `gateway stop during shutdown failed: ${err.message}`);
   }
 
   process.exit(0);

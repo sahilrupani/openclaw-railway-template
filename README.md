@@ -1,140 +1,98 @@
-# OpenClaw Railway Template (1‑click deploy)
+# Deploy and Host OpenClaw on Railway
 
-## Setup
+OpenClaw is an open-source personal AI assistant platform with 328,000+ GitHub stars that connects 20+ messaging apps — WhatsApp, Telegram, Discord, Slack, iMessage, Signal, and more — to powerful AI models like Claude, GPT-4, and Gemini. This Railway template deploys OpenClaw with a browser-based setup wizard, web terminal, and device management — no CLI, no SSH, no config files required.
 
-<img width="2110" height="2032" alt="CleanShot 2026-02-23 at 21 57 59@2x" src="https://github.com/user-attachments/assets/28640eec-fa35-42f2-ba56-cb1fbb9525de" />
+**One gateway. Every chat app. Any AI model. Your infrastructure.**
 
-## Setup completed
+## About Hosting OpenClaw
 
-<img width="1860" height="2624" alt="CleanShot 2026-02-23 at 21 59 06@2x" src="https://github.com/user-attachments/assets/2605d44c-4319-4e92-838c-3caa726b9595" />
+This template wraps OpenClaw in a production-ready container with a browser-based setup wizard at `/setup`, a web terminal at `/tui`, and a full admin dashboard — all protected by a password you set at deploy time. Your config, credentials, conversation history, and workspace files persist on a Railway Volume so nothing is lost on redeploys.
 
-## TUI
+After deployment, open your Railway URL, complete the 3-step wizard, connect your messaging channels, and start chatting with your AI agent from any device, anywhere.
 
-<img width="2510" height="608" alt="CleanShot 2026-02-23 at 22 08 20@2x" src="https://github.com/user-attachments/assets/61147ec2-ddd5-4b5b-b9ac-0dd81a1ae4c7" />
+![OpenClaw Setup Wizard](https://github.com/user-attachments/assets/28640eec-fa35-42f2-ba56-cb1fbb9525de)
 
-## Device approval
+## Common Use Cases
 
-<img width="1712" height="1376" alt="CleanShot 2026-02-23 at 21 59 21@2x" src="https://github.com/user-attachments/assets/f30ab683-dbc2-4980-ace7-152265e00c79" />
+- **Personal AI Assistant** — Chat with Claude or GPT via Telegram, Discord, or the web interface for research, writing, coding help, and daily task management
+- **Multi-Channel Unified Inbox** — Connect WhatsApp, Telegram, Discord, and Slack to a single AI agent — one brain across all your messaging apps
+- **Automated Workflows** — Schedule recurring tasks, monitor websites, send notifications, and run cron jobs via your AI agent
+- **Browser Automation** — Let your agent browse the web, extract data, fill forms, and take screenshots autonomously
+- **Voice-Enabled Workflows** — Use wake words and voice commands to control your AI agent via macOS, iOS, or Android
+- **Multi-Agent Routing** — Route different channels to isolated agents with separate workspaces, sessions, and personas
 
-## What you get
+![OpenClaw Setup Completed](https://github.com/user-attachments/assets/2605d44c-4319-4e92-838c-3caa726b9595)
 
-- **OpenClaw Gateway + Control UI** (served at `/` and `/openclaw`)
-- A friendly **Setup Wizard** at `/setup` (protected by a password)
-- Optional **Web Terminal** at `/tui` for browser-based TUI access
-- Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
+## OpenClaw vs. Other Self-Hosted AI Agents
 
-## How it works (high level)
+### OpenClaw vs. Hermes Agent
 
-- The container runs a wrapper web server.
-- The wrapper protects `/setup` with `SETUP_PASSWORD`.
-- During setup, the wrapper runs `openclaw onboard --non-interactive ...` inside the container, writes state to the volume, and then starts the gateway.
-- After setup, **`/` is OpenClaw**. The wrapper reverse-proxies all traffic (including WebSockets) to the local gateway process.
+Hermes Agent by Nous Research builds a skill library from experience using a learning loop — it gets more capable over time. OpenClaw prioritises breadth: 20+ messaging channel integrations, voice wake words, browser automation, a Live Canvas workspace, and companion apps for macOS, iOS, and Android. If you want deep multi-platform messaging coverage and browser control from day one, OpenClaw is the stronger choice. If you want a self-improving agent that accumulates domain knowledge, Hermes Agent is worth evaluating.
 
-## Getting chat tokens (so you don't have to scramble)
+### OpenClaw vs. Auto-GPT
 
-### Telegram bot token
+Auto-GPT runs one-shot autonomous tasks and stops. OpenClaw runs as a persistent, always-on gateway — it stays connected to your messaging channels 24/7, maintains session memory per sender, and handles new messages as they arrive. Auto-GPT has no messaging integrations. OpenClaw is your always-available assistant, not a one-time task runner.
 
-1. Open Telegram and message **@BotFather**
-2. Run `/newbot` and follow the prompts
-3. BotFather will give you a token that looks like: `123456789:AA...`
-4. Paste that token into `/setup`
+### OpenClaw vs. Open WebUI
 
-### Discord bot token
+Open WebUI is a self-hosted chat interface — a browser-based front end for talking to local LLMs. It has no messaging integrations, no cron jobs, no browser automation, and no multi-channel routing. OpenClaw routes messages from Telegram, WhatsApp, Discord, and 17+ other platforms to your AI agent and executes tool calls autonomously. They solve different problems.
 
-1. Go to the Discord Developer Portal: https://discord.com/developers/applications
-2. **New Application** → pick a name
-3. Open the **Bot** tab → **Add Bot**
-4. Copy the **Bot Token** and paste it into `/setup`
-5. Invite the bot to your server (OAuth2 URL Generator → scopes: `bot`, `applications.commands`; then choose permissions)
+## What You Get With This Template
 
-## Web Terminal (TUI)
+- **OpenClaw Gateway + Control UI** served at `/` and `/openclaw`
+- **Browser-based Setup Wizard** at `/setup` — protected by `SETUP_PASSWORD`
+- **Web Terminal (TUI)** at `/tui` — run `openclaw` CLI commands from your browser
+- **Device Management** — approve and revoke paired devices from the dashboard
+- **Persistent Railway Volume** — config, credentials, and memory survive every redeploy
 
-The template includes an optional web-based terminal that runs `openclaw tui` in your browser.
+![OpenClaw Web Terminal](https://github.com/user-attachments/assets/61147ec2-ddd5-4b5b-b9ac-0dd81a1ae4c7)
 
-### Enabling
+## Dependencies for OpenClaw Hosting
 
-Set `ENABLE_WEB_TUI=true` in your Railway Variables. The terminal is **disabled by default**.
+- **AI Provider API Key** — Anthropic Claude, OpenAI GPT, Google Gemini, Groq, or any OpenRouter-supported model
+- **Messaging Channel Token** — Telegram bot token (via @BotFather) and/or Discord bot token (via Discord Developer Portal)
+- **Railway Volume** — pre-configured in this template. Mounts at `/data` for persistent state
 
-Once enabled, access it at `/tui` or via the "Open Terminal" button on the setup page.
+### Deployment Dependencies
 
-### Security
+- [OpenClaw Official Website](https://openclaw.ai)
+- [OpenClaw GitHub Repository](https://github.com/openclaw/openclaw)
+- [OpenClaw Documentation](https://docs.openclaw.ai)
+- [OpenClaw Integrations — 50+ supported platforms](https://openclaw.ai/#integrations)
 
-The web TUI implements multiple security layers:
+### Implementation Details
 
-| Control | Description |
-|---------|-------------|
-| **Opt-in only** | Disabled by default, requires explicit `ENABLE_WEB_TUI=true` |
-| **Password protected** | Uses the same `SETUP_PASSWORD` as the setup wizard |
-| **Single session** | Only 1 concurrent TUI session allowed at a time |
-| **Idle timeout** | Auto-closes after 5 minutes of inactivity (configurable via `TUI_IDLE_TIMEOUT_MS`) |
-| **Max duration** | Hard limit of 30 minutes per session (configurable via `TUI_MAX_SESSION_MS`) |
+Once deployed, visit `/setup` to complete onboarding. The wizard runs `openclaw onboard --non-interactive` inside the container, writes state to the Railway Volume, and starts the gateway. After setup, `/` is OpenClaw — the wrapper reverse-proxies all traffic including WebSockets to the local gateway process.
 
-### Configuration
+```
+# Connect Telegram
+1. Message @BotFather → /newbot → copy token → paste into /setup
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ENABLE_WEB_TUI` | `false` | Set to `true` to enable |
-| `TUI_IDLE_TIMEOUT_MS` | `300000` (5 min) | Closes session after inactivity |
-| `TUI_MAX_SESSION_MS` | `1800000` (30 min) | Maximum session duration |
+# Connect Discord
+1. Discord Developer Portal → New Application → Bot → Copy Token → paste into /setup
+2. OAuth2 URL Generator → scopes: bot, applications.commands → invite to server
 
-## Local testing
-
-```bash
-docker build -t openclaw-railway-template .
-
-docker run --rm -p 8080:8080 \
-  -e PORT=8080 \
-  -e SETUP_PASSWORD=test \
-  -e ENABLE_WEB_TUI=true \
-  -e OPENCLAW_STATE_DIR=/data/.openclaw \
-  -e OPENCLAW_WORKSPACE_DIR=/data/workspace \
-  -v $(pwd)/.tmpdata:/data \
-  openclaw-railway-template
-
-# Setup wizard: http://localhost:8080/setup (password: test)
-# Web terminal: http://localhost:8080/tui (after setup)
+# Switch AI model after setup (via web terminal at /tui)
+openclaw models set anthropic/claude-sonnet-4-20250514
+openclaw models list --all
 ```
 
-## FAQ
+The web terminal (`/tui`) requires `ENABLE_WEB_TUI=true` in your Railway Variables. It is disabled by default. Sessions are limited to 1 concurrent user, auto-close after 5 minutes of inactivity, and hard-cap at 30 minutes.
 
-**Q: How do I access the setup page?**
+![OpenClaw Device Approval](https://github.com/user-attachments/assets/f30ab683-dbc2-4980-ace7-152265e00c79)
 
-A: Go to `/setup` on your deployed instance. When prompted for credentials, use the generated `SETUP_PASSWORD` from your Railway Variables as the password. The username field is ignored—you can leave it empty or enter anything.
+**Environment Variables:**
 
-**Q: I see "gateway disconnected" or authentication errors in the Control UI. What should I do?**
+| Variable | Required | Description |
+|---|---|---|
+| `SETUP_PASSWORD` | ✅ | Password for `/setup` wizard and `/tui` terminal |
+| `ENABLE_WEB_TUI` | Optional | Set `true` to enable web terminal at `/tui`. Default: `false` |
+| `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` | Optional | Comma-separated list of allowed origins for custom domains |
+| `TUI_IDLE_TIMEOUT_MS` | Optional | Idle timeout for web terminal. Default: `300000` (5 min) |
+| `TUI_MAX_SESSION_MS` | Optional | Max session duration for web terminal. Default: `1800000` (30 min) |
 
-A: Go back to `/setup` and click the "Open OpenClaw UI" button from there. The setup page passes the required auth token to the UI. Accessing the UI directly without the token will cause connection errors.
+## Why Deploy OpenClaw on Railway?
 
-**Q: I see "origin not allowed (open the Control UI from the gateway host or allow it in gateway.controlUi.allowedOrigins)". How do I fix it?**
+Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.
 
-A: Redeploy with the latest template code so the wrapper auto-configures `gateway.controlUi.allowedOrigins` for your Railway host. If you use custom domains, set `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` (comma-separated or JSON array) in Railway Variables and redeploy.
-
-**Q: I don't see the TUI option on the setup page.**
-
-A: Make sure `ENABLE_WEB_TUI=true` is set in your Railway Variables and redeploy. The web terminal is disabled by default.
-
-**Q: How do I approve pairing for Telegram or Discord?**
-
-A: Go to `/setup` and use the "Approve Pairing" dialog to approve pending pairing requests from your chat channels.
-
-**Q: I see "pairing required" when opening the Control UI. How do I fix it?**
-
-A: New browsers/devices need a one-time approval from the gateway. Go to `/setup`, click "Manage Devices" in the Devices section, and click "Approve Latest Request". Refresh the Control UI and it should connect. Local connections (127.0.0.1) are auto-approved; remote connections (LAN, public URL) require explicit approval.
-
-**Q: How do I change the AI model after setup?**
-
-A: Use the OpenClaw CLI to switch models. Access the web terminal at `/tui` (if enabled) or SSH into your container and run:
-
-```bash
-openclaw models set provider/model-id
-```
-
-For example: `openclaw models set anthropic/claude-sonnet-4-20250514` or `openclaw models set openai/gpt-4-turbo`. Use `openclaw models list --all` to see available models.
-
-**Q: My config seems broken or I'm getting strange errors. How do I fix it?**
-
-A: Go to `/setup` and click the "Run Doctor" button. This runs `openclaw doctor --repair` which performs health checks on your gateway and channels, creates a backup of your config, and removes any unrecognized or corrupted configuration keys.
-
-## Support
-
-Need help? [Request support on Railway Station](https://station.railway.com/all-templates/d0880c01-2cc5-462c-8b76-d84c1a203348)
+By deploying OpenClaw on Railway, you are one step closer to supporting a complete full-stack application with minimal burden. Host your servers, databases, AI agents, and more on Railway.
